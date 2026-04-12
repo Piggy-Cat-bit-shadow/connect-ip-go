@@ -256,21 +256,21 @@ func (c *Conn) writeToStream() error {
 	}
 }
 
-func (c *Conn) ReadPacket(b []byte) (n int, err error) {
+func (c *Conn) ReadPacket() (b []byte, err error) {
 start:
 	data, err := c.str.ReceiveDatagram(context.Background())
 	if err != nil {
 		select {
 		case <-c.closeChan:
-			return 0, c.closeErr
+			return nil, c.closeErr
 		default:
-			return 0, err
+			return nil, err
 		}
 	}
 	contextID, n, err := quicvarint.Parse(data)
 	if err != nil {
 		// TODO: close connection
-		return 0, fmt.Errorf("connect-ip: malformed datagram: %w", err)
+		return nil, fmt.Errorf("connect-ip: malformed datagram: %w", err)
 	}
 	if contextID != 0 {
 		// Drop this datagram. We currently only support proxying of IP payloads.
@@ -280,7 +280,7 @@ start:
 		log.Printf("dropping proxied packet: %s", err)
 		goto start
 	}
-	return copy(b, data[n:]), nil
+	return data[n:], nil
 }
 
 func (c *Conn) handleIncomingProxiedPacket(data []byte) error {
