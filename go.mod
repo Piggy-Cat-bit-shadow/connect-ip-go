@@ -1,4 +1,4 @@
-module github.com/metacubex/connect-ip-go
+module github.com/Piggy-Cat-bit-shadow/connect-ip-go
 
 go 1.20
 
