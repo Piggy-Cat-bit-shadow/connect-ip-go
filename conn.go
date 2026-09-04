@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"time"
 
 	"golang.org/x/exp/slices"
 	"golang.org/x/net/ipv4"
@@ -259,8 +260,35 @@ func (c *Conn) writeToStream() error {
 }
 
 func (c *Conn) ReadPacket() (b []byte, err error) {
+	return c.readPacket(context.Background())
+}
+
+// TryReadPacket returns one already-queued IP packet without waiting for a
+// future QUIC DATAGRAM. It is intended for bounded opportunistic draining.
+// ReadPacket retains its blocking behavior for existing callers.
+func (c *Conn) TryReadPacket() (b []byte, err error) {
+	return c.readPacket(canceledContext{})
+}
+
+// canceledContext is deliberately canceled before ReceiveDatagram checks its
+// queue. The pinned quic-go implementation checks queued data first, making
+// this a true nonblocking poll rather than a timeout-based approximation.
+type canceledContext struct{}
+
+func (canceledContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (canceledContext) Done() <-chan struct{}       { return canceledDone }
+func (canceledContext) Err() error                  { return context.Canceled }
+func (canceledContext) Value(any) any               { return nil }
+
+var canceledDone = func() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
+
+func (c *Conn) readPacket(ctx context.Context) (b []byte, err error) {
 start:
-	data, err := c.str.ReceiveDatagram(context.Background())
+	data, err := c.str.ReceiveDatagram(ctx)
 	if err != nil {
 		select {
 		case <-c.closeChan:
