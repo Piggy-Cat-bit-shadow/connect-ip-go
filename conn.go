@@ -47,6 +47,23 @@ type http3Stream interface {
 	CancelRead(quic.StreamErrorCode)
 }
 
+type http3BufferStream interface {
+	ReceiveDatagramBuffer(context.Context) (*quic.DatagramBuffer, error)
+}
+
+type PacketBuffer struct {
+	Data    []byte
+	release func()
+}
+
+func (b *PacketBuffer) Release() {
+	if b != nil && b.release != nil {
+		r := b.release
+		b.release = nil
+		r()
+	}
+}
+
 var (
 	_ http3Stream = &http3.Stream{}
 	_ http3Stream = &http3.RequestStream{}
@@ -260,14 +277,76 @@ func (c *Conn) writeToStream() error {
 }
 
 func (c *Conn) ReadPacket() (b []byte, err error) {
-	return c.readPacket(context.Background())
+	p, err := c.ReadPacketBuffer()
+	if err != nil {
+		return nil, err
+	}
+	data := append([]byte(nil), p.Data...)
+	p.Release()
+	return data, nil
 }
 
 // TryReadPacket returns one already-queued IP packet without waiting for a
 // future QUIC DATAGRAM. It is intended for bounded opportunistic draining.
 // ReadPacket retains its blocking behavior for existing callers.
 func (c *Conn) TryReadPacket() (b []byte, err error) {
-	return c.readPacket(canceledContext{})
+	p, err := c.TryReadPacketBuffer()
+	if err != nil {
+		return nil, err
+	}
+	data := append([]byte(nil), p.Data...)
+	p.Release()
+	return data, nil
+}
+
+func (c *Conn) ReadPacketBuffer() (*PacketBuffer, error) {
+	return c.readPacketBuffer(context.Background())
+}
+func (c *Conn) TryReadPacketBuffer() (*PacketBuffer, error) {
+	return c.readPacketBuffer(canceledContext{})
+}
+
+func (c *Conn) readPacketBuffer(ctx context.Context) (*PacketBuffer, error) {
+	var data []byte
+	var owner interface{ Release() }
+	if s, ok := c.str.(http3BufferStream); ok {
+		b, err := s.ReceiveDatagramBuffer(ctx)
+		if err != nil {
+			return nil, err
+		}
+		data, owner = b.Data, b
+	} else {
+		b, err := c.readPacket(ctx)
+		if err != nil {
+			return nil, err
+		}
+		data = append([]byte(nil), b...)
+	}
+	for {
+		contextID, n, err := quicvarint.Parse(data)
+		if err != nil {
+			if owner != nil {
+				owner.Release()
+			}
+			return nil, fmt.Errorf("connect-ip: malformed datagram: %w", err)
+		}
+		if contextID != 0 {
+			if owner != nil {
+				owner.Release()
+			}
+			return c.readPacketBuffer(ctx)
+		}
+		if err := c.handleIncomingProxiedPacket(data[n:]); err != nil {
+			if owner != nil {
+				owner.Release()
+			}
+			continue
+		}
+		if owner == nil {
+			return &PacketBuffer{Data: data[n:]}, nil
+		}
+		return &PacketBuffer{Data: data[n:], release: owner.Release}, nil
+	}
 }
 
 // canceledContext is deliberately canceled before ReceiveDatagram checks its
