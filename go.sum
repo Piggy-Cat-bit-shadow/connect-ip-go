@@ -1,5 +1,7 @@
 github.com/Piggy-Cat-bit-shadow/quic-go v0.0.0-20260904230354-1c94200c0b42 h1:1WXViHZI57tzCtmim3GuPkZVX+z4K2C6YMqEVLJn6Og=
 github.com/Piggy-Cat-bit-shadow/quic-go v0.0.0-20260904230354-1c94200c0b42/go.mod h1:KTmibo7vZo0gCxdFWrPEQ/u/RGt92mJkrXDE2Qg2/AU=
+github.com/Piggy-Cat-bit-shadow/quic-go v0.0.0-20260904234804-0f7faaa7c726 h1:LuEB+i4F3l0Rfo+rnrymiOyj4NlVTYnytS4x0LEwDBg=
+github.com/Piggy-Cat-bit-shadow/quic-go v0.0.0-20260904234804-0f7faaa7c726/go.mod h1:KTmibo7vZo0gCxdFWrPEQ/u/RGt92mJkrXDE2Qg2/AU=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/dunglas/httpsfv v1.0.2 h1:iERDp/YAfnojSDJ7PW3dj1AReJz4MrwbECSSE59JWL0=

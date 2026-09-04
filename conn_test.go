@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -311,6 +312,23 @@ type mockBufferStream struct {
 	bufferCalls int
 }
 
+type mockOwnedBufferStream struct {
+	mockBufferStream
+	ownedCalls int
+}
+
+func (m *mockOwnedBufferStream) SendDatagramBufferOwned(buf []byte, offset, length int, owner quic.DatagramPayloadOwner) error {
+	m.buffer = buf
+	m.offset = offset
+	m.length = length
+	m.ownedCalls++
+	return m.sendDatagramErr
+}
+
+type countingOwner struct{ releases atomic.Int32 }
+
+func (o *countingOwner) Release() { o.releases.Add(1) }
+
 func (m *mockBufferStream) SendDatagramBuffer(buf []byte, offset, length int) error {
 	m.buffer = buf
 	m.offset = offset
@@ -371,4 +389,31 @@ func TestWritePacketBufferRejectsInvalidRange(t *testing.T) {
 	conn := newProxiedConn(&mockStream{})
 	_, err := conn.WritePacketBuffer(make([]byte, 4), 5, 1)
 	require.ErrorContains(t, err, "invalid packet buffer range")
+}
+
+func TestWritePacketBufferOwnedTransfersHeadroomOwner(t *testing.T) {
+	str := &mockOwnedBufferStream{}
+	conn := newProxiedConn(str)
+	ip := testIPv4Packet(t)
+	buf := make([]byte, 9+len(ip))
+	copy(buf[9:], ip)
+	owner := new(countingOwner)
+	_, err := conn.WritePacketBufferOwned(buf, 9, len(ip), owner)
+	require.NoError(t, err)
+	require.Equal(t, 1, str.ownedCalls)
+	require.Zero(t, owner.releases.Load(), "accepted owned send must retain ownership")
+	require.Equal(t, byte(0), buf[8])
+	owner.Release()
+}
+
+func TestWritePacketBufferOwnedReleasesOnSendError(t *testing.T) {
+	str := &mockOwnedBufferStream{mockBufferStream: mockBufferStream{mockStream: mockStream{sendDatagramErr: &quic.DatagramTooLargeError{MaxDatagramPayloadSize: 1200}}}}
+	conn := newProxiedConn(str)
+	ip := testIPv4Packet(t)
+	buf := make([]byte, 9+len(ip))
+	copy(buf[9:], ip)
+	owner := new(countingOwner)
+	_, err := conn.WritePacketBufferOwned(buf, 9, len(ip), owner)
+	require.NoError(t, err, "too-large errors are converted to ICMP")
+	require.EqualValues(t, 1, owner.releases.Load())
 }

@@ -56,6 +56,15 @@ type http3BufferSender interface {
 	SendDatagramBuffer([]byte, int, int) error
 }
 
+type http3OwnedBufferSender interface {
+	SendDatagramBufferOwned([]byte, int, int, quic.DatagramPayloadOwner) error
+}
+
+// PacketPayloadOwner owns the caller's packet backing. WritePacketBufferOwned
+// releases it on every non-transferred path and transfers it to the HTTP/3 /
+// QUIC send queue only after that queue accepts the frame.
+type PacketPayloadOwner interface{ Release() }
+
 type PacketBuffer struct {
 	Data     []byte
 	release  func()
@@ -521,6 +530,52 @@ func (c *Conn) WritePacketBuffer(buf []byte, offset, length int) (icmp []byte, e
 			return composeICMPTooLargePacket(p, minMTU)
 		}
 		return nil, err
+	}
+	return nil, nil
+}
+
+// WritePacketBufferOwned sends an IP packet while transferring ownership of
+// buf to the asynchronous HTTP/3 / QUIC path. The owner is released by this
+// method unless the owned lower layer accepts the buffer. Callers must not
+// release owner after this method returns.
+func (c *Conn) WritePacketBufferOwned(buf []byte, offset, length int, owner PacketPayloadOwner) (icmp []byte, err error) {
+	transferred := false
+	defer func() {
+		if !transferred && owner != nil {
+			owner.Release()
+		}
+	}()
+	if offset < 0 || length < 0 || offset > len(buf) || length > len(buf)-offset {
+		return nil, fmt.Errorf("connect-ip: invalid packet buffer range: offset=%d length=%d buffer=%d", offset, length, len(buf))
+	}
+	if offset < len(contextIDZero) {
+		return c.WritePacketBuffer(buf, offset, length)
+	}
+	p := buf[offset : offset+length]
+	if err = c.composeDatagramInPlace(p); err != nil {
+		return nil, nil
+	}
+	copy(buf[offset-len(contextIDZero):offset], contextIDZero)
+	dataOffset := offset - len(contextIDZero)
+	dataLength := length + len(contextIDZero)
+	if sender, ok := c.str.(http3OwnedBufferSender); ok {
+		err = sender.SendDatagramBufferOwned(buf, dataOffset, dataLength, owner)
+	} else if sender, ok := c.str.(http3BufferSender); ok {
+		err = sender.SendDatagramBuffer(buf, dataOffset, dataLength)
+	} else {
+		err = c.str.SendDatagram(buf[dataOffset : dataOffset+dataLength])
+	}
+	if err != nil {
+		var tooLarge *quic.DatagramTooLargeError
+		if errors.As(err, &tooLarge) {
+			return composeICMPTooLargePacket(p, minMTU)
+		}
+		return nil, err
+	}
+	// The legacy HTTP/3 fallback copies synchronously and doesn't transfer
+	// ownership itself. The owned sender does.
+	if _, ok := c.str.(http3OwnedBufferSender); ok {
+		transferred = true
 	}
 	return nil, nil
 }
