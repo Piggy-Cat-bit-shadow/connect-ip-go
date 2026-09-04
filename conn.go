@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/exp/slices"
@@ -52,15 +53,14 @@ type http3BufferStream interface {
 }
 
 type PacketBuffer struct {
-	Data    []byte
-	release func()
+	Data     []byte
+	release  func()
+	released atomic.Bool
 }
 
 func (b *PacketBuffer) Release() {
-	if b != nil && b.release != nil {
-		r := b.release
-		b.release = nil
-		r()
+	if b != nil && b.released.CompareAndSwap(false, true) && b.release != nil {
+		b.release()
 	}
 }
 
