@@ -27,6 +27,7 @@ type mockStream struct {
 	reading         []byte
 	toRead          <-chan []byte
 	sendDatagramErr error
+	sentDatagrams   [][]byte
 }
 
 var _ http3Stream = &mockStream{}
@@ -48,7 +49,10 @@ func (m *mockStream) Context() context.Context          { return context.Backgro
 func (m *mockStream) SetWriteDeadline(time.Time) error  { return nil }
 func (m *mockStream) SetReadDeadline(time.Time) error   { return nil }
 func (m *mockStream) SetDeadline(time.Time) error       { return nil }
-func (m *mockStream) SendDatagram(data []byte) error    { return m.sendDatagramErr }
+func (m *mockStream) SendDatagram(data []byte) error {
+	m.sentDatagrams = append(m.sentDatagrams, data)
+	return m.sendDatagramErr
+}
 func (m *mockStream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()
@@ -297,4 +301,74 @@ func TestSendLargeDatagrams(t *testing.T) {
 	icmp, err := conn.WritePacket(data)
 	require.NoError(t, err)
 	require.NotNil(t, icmp)
+}
+
+type mockBufferStream struct {
+	mockStream
+	buffer      []byte
+	offset      int
+	length      int
+	bufferCalls int
+}
+
+func (m *mockBufferStream) SendDatagramBuffer(buf []byte, offset, length int) error {
+	m.buffer = buf
+	m.offset = offset
+	m.length = length
+	m.bufferCalls++
+	return m.sendDatagramErr
+}
+
+func testIPv4Packet(t *testing.T) []byte {
+	t.Helper()
+	b, err := (&ipv4.Header{
+		Version:  4,
+		Len:      20,
+		TTL:      64,
+		Src:      net.IPv4(1, 2, 3, 4),
+		Dst:      net.IPv4(5, 6, 7, 8),
+		Protocol: 17,
+	}).Marshal()
+	require.NoError(t, err)
+	return b
+}
+
+func TestWritePacketBufferUsesOptionalHeadroomSender(t *testing.T) {
+	str := &mockBufferStream{}
+	conn := newProxiedConn(str)
+	ip := testIPv4Packet(t)
+	buf := make([]byte, 9+len(ip))
+	copy(buf[9:], ip)
+
+	_, err := conn.WritePacketBuffer(buf, 9, len(ip))
+	require.NoError(t, err)
+	require.Equal(t, 1, str.bufferCalls)
+	require.Equal(t, 8, str.offset)
+	require.Equal(t, len(ip)+1, str.length)
+	require.Equal(t, byte(0), buf[8])
+	require.Equal(t, byte(63), buf[9+8])
+	if &buf[8] != &str.buffer[str.offset] {
+		t.Fatal("buffer-aware sender did not receive the original backing")
+	}
+	require.Equal(t, buf[8:8+str.length], str.buffer[str.offset:str.offset+str.length])
+}
+
+func TestWritePacketBufferKeepsLegacySenderCompatible(t *testing.T) {
+	str := &mockStream{}
+	conn := newProxiedConn(str)
+	ip := testIPv4Packet(t)
+	buf := make([]byte, 9+len(ip))
+	copy(buf[9:], ip)
+
+	_, err := conn.WritePacketBuffer(buf, 9, len(ip))
+	require.NoError(t, err)
+	require.Len(t, str.sentDatagrams, 1)
+	require.Equal(t, byte(0), str.sentDatagrams[0][0])
+	require.Equal(t, byte(63), str.sentDatagrams[0][9])
+}
+
+func TestWritePacketBufferRejectsInvalidRange(t *testing.T) {
+	conn := newProxiedConn(&mockStream{})
+	_, err := conn.WritePacketBuffer(make([]byte, 4), 5, 1)
+	require.ErrorContains(t, err, "invalid packet buffer range")
 }

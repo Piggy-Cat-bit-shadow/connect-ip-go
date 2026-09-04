@@ -52,6 +52,10 @@ type http3BufferStream interface {
 	ReceiveDatagramBuffer(context.Context) (*quic.DatagramBuffer, error)
 }
 
+type http3BufferSender interface {
+	SendDatagramBuffer([]byte, int, int) error
+}
+
 type PacketBuffer struct {
 	Data     []byte
 	release  func()
@@ -494,8 +498,11 @@ func (c *Conn) WritePacket(b []byte) (icmp []byte, err error) {
 // CONNECT-IP allocation/copy. quic-go copies into its own datagram frame before
 // returning, so callers may immediately reuse buf after this call.
 func (c *Conn) WritePacketBuffer(buf []byte, offset, length int) (icmp []byte, err error) {
-	if offset < len(contextIDZero) || length < 0 || offset+length > len(buf) {
-		return c.WritePacket(buf[offset:offset])
+	if offset < 0 || length < 0 || offset > len(buf) || length > len(buf)-offset {
+		return nil, fmt.Errorf("connect-ip: invalid packet buffer range: offset=%d length=%d buffer=%d", offset, length, len(buf))
+	}
+	if offset < len(contextIDZero) {
+		return c.WritePacket(buf[offset : offset+length])
 	}
 	p := buf[offset : offset+length]
 	if err = c.composeDatagramInPlace(p); err != nil {
@@ -503,7 +510,12 @@ func (c *Conn) WritePacketBuffer(buf []byte, offset, length int) (icmp []byte, e
 	}
 	copy(buf[offset-len(contextIDZero):offset], contextIDZero)
 	data := buf[offset-len(contextIDZero) : offset+length]
-	if err = c.str.SendDatagram(data); err != nil {
+	if sender, ok := c.str.(http3BufferSender); ok {
+		err = sender.SendDatagramBuffer(buf, offset-len(contextIDZero), length+len(contextIDZero))
+	} else {
+		err = c.str.SendDatagram(data)
+	}
+	if err != nil {
 		var tooLarge *quic.DatagramTooLargeError
 		if errors.As(err, &tooLarge) {
 			return composeICMPTooLargePacket(p, minMTU)
