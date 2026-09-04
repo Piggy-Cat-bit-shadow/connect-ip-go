@@ -382,39 +382,69 @@ func (c *Conn) WritePacket(b []byte) (icmp []byte, err error) {
 	return nil, nil
 }
 
+// WritePacketBuffer sends buf[offset:offset+length]. When offset provides the
+// one-byte CONNECT-IP Context ID headroom, it prepends in place and avoids the
+// CONNECT-IP allocation/copy. quic-go copies into its own datagram frame before
+// returning, so callers may immediately reuse buf after this call.
+func (c *Conn) WritePacketBuffer(buf []byte, offset, length int) (icmp []byte, err error) {
+	if offset < len(contextIDZero) || length < 0 || offset+length > len(buf) {
+		return c.WritePacket(buf[offset:offset])
+	}
+	p := buf[offset : offset+length]
+	if err = c.composeDatagramInPlace(p); err != nil {
+		return nil, nil
+	}
+	copy(buf[offset-len(contextIDZero):offset], contextIDZero)
+	data := buf[offset-len(contextIDZero) : offset+length]
+	if err = c.str.SendDatagram(data); err != nil {
+		var tooLarge *quic.DatagramTooLargeError
+		if errors.As(err, &tooLarge) {
+			return composeICMPTooLargePacket(p, minMTU)
+		}
+		return nil, err
+	}
+	return nil, nil
+}
+
 func (c *Conn) composeDatagram(b []byte) ([]byte, error) {
+	if err := c.composeDatagramInPlace(b); err != nil {
+		return nil, err
+	}
+	data := make([]byte, 0, len(contextIDZero)+len(b))
+	data = append(data, contextIDZero...)
+	return append(data, b...), nil
+}
+
+func (c *Conn) composeDatagramInPlace(b []byte) error {
 	// TODO: implement src, dst and ipproto checks
 	if len(b) == 0 {
-		return nil, nil
+		return nil
 	}
 	switch v := ipVersion(b); v {
 	default:
-		return nil, fmt.Errorf("connect-ip: unknown IP versions: %d", v)
+		return fmt.Errorf("connect-ip: unknown IP versions: %d", v)
 	case 4:
 		if len(b) < ipv4.HeaderLen {
-			return nil, fmt.Errorf("connect-ip: IPv4 packet too short")
+			return fmt.Errorf("connect-ip: IPv4 packet too short")
 		}
 		ttl := b[8]
 		if ttl <= 1 {
-			return nil, fmt.Errorf("connect-ip: datagram TTL too small: %d", ttl)
+			return fmt.Errorf("connect-ip: datagram TTL too small: %d", ttl)
 		}
 		b[8]-- // decrement TTL
 		// recalculate the checksum
 		binary.BigEndian.PutUint16(b[10:12], calculateIPv4Checksum(([ipv4.HeaderLen]byte)(b[:ipv4.HeaderLen])))
 	case 6:
 		if len(b) < ipv6.HeaderLen {
-			return nil, fmt.Errorf("connect-ip: IPv6 packet too short")
+			return fmt.Errorf("connect-ip: IPv6 packet too short")
 		}
 		hopLimit := b[7]
 		if hopLimit <= 1 {
-			return nil, fmt.Errorf("connect-ip: datagram Hop Limit too small: %d", hopLimit)
+			return fmt.Errorf("connect-ip: datagram Hop Limit too small: %d", hopLimit)
 		}
 		b[7]-- // Decrement Hop Limit
 	}
-	data := make([]byte, 0, len(contextIDZero)+len(b))
-	data = append(data, contextIDZero...)
-	data = append(data, b...)
-	return data, nil
+	return nil
 }
 
 func (c *Conn) Close() error {
