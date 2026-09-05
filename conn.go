@@ -51,6 +51,10 @@ type http3BufferStream interface {
 	ReceiveDatagramBuffer(context.Context) (*quic.DatagramBuffer, error)
 }
 
+type http3TryBufferStream interface {
+	TryReceiveDatagramBuffer() (*quic.DatagramBuffer, error)
+}
+
 type http3BufferSender interface {
 	SendDatagramBuffer([]byte, int, int) error
 }
@@ -305,7 +309,37 @@ func (c *Conn) ReadPacketBuffer() (*PacketBuffer, error) {
 	return c.readPacketBuffer(context.Background())
 }
 func (c *Conn) TryReadPacketBuffer() (*PacketBuffer, error) {
+	if s, ok := c.str.(http3TryBufferStream); ok {
+		return c.tryReadBorrowedPacketBuffer(s)
+	}
+	// Legacy streams do not expose an explicit poll operation. Keep the old
+	// behavior for those implementations only; production HTTP/3 streams use
+	// the explicit API above.
 	return c.readPacketBuffer(canceledContext{})
+}
+
+func (c *Conn) tryReadBorrowedPacketBuffer(s http3TryBufferStream) (*PacketBuffer, error) {
+	for {
+		b, err := s.TryReceiveDatagramBuffer()
+		if err != nil {
+			return nil, c.mapReceiveError(err)
+		}
+		contextID, n, err := quicvarint.Parse(b.Data)
+		if err != nil {
+			b.Release()
+			return nil, fmt.Errorf("connect-ip: malformed datagram: %w", err)
+		}
+		if contextID != 0 {
+			b.Release()
+			continue
+		}
+		if err := c.handleIncomingProxiedPacket(b.Data[n:]); err != nil {
+			b.Release()
+			continue
+		}
+		b.Data = b.Data[n:]
+		return (*PacketBuffer)(b), nil
+	}
 }
 
 func (c *Conn) readPacketBuffer(ctx context.Context) (*PacketBuffer, error) {
@@ -571,13 +605,25 @@ func (c *Conn) composeDatagramInPlace(b []byte) error {
 		if len(b) < ipv4.HeaderLen {
 			return fmt.Errorf("connect-ip: IPv4 packet too short")
 		}
+		version := b[0] >> 4
+		ihlWords := b[0] & 0x0f
+		if version != 4 {
+			return fmt.Errorf("connect-ip: unknown IP versions: %d", version)
+		}
+		if ihlWords < 5 {
+			return fmt.Errorf("connect-ip: invalid IPv4 header length: %d", ihlWords)
+		}
+		ihl := int(ihlWords) * 4
+		if ihl > len(b) {
+			return fmt.Errorf("connect-ip: IPv4 header length %d exceeds packet length %d", ihl, len(b))
+		}
 		ttl := b[8]
 		if ttl <= 1 {
 			return fmt.Errorf("connect-ip: datagram TTL too small: %d", ttl)
 		}
 		b[8]-- // decrement TTL
-		// recalculate the checksum
-		binary.BigEndian.PutUint16(b[10:12], calculateIPv4Checksum(([ipv4.HeaderLen]byte)(b[:ipv4.HeaderLen])))
+		// Recalculate over the complete IPv4 header, including options.
+		binary.BigEndian.PutUint16(b[10:12], calculateIPv4Checksum(b[:ihl]))
 	case 6:
 		if len(b) < ipv6.HeaderLen {
 			return fmt.Errorf("connect-ip: IPv6 packet too short")

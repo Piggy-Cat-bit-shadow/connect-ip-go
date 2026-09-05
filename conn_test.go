@@ -2,7 +2,9 @@ package connectip
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"sync/atomic"
@@ -77,6 +79,22 @@ type mockReceiveBufferStream struct {
 	bufferDatagrams [][]byte
 	bufferObjects   []*quic.DatagramBuffer
 	bufferCalls     int
+}
+
+type mockTryBufferStream struct {
+	mockReceiveBufferStream
+	tryObjects []*quic.DatagramBuffer
+	tryCalls   int
+}
+
+func (m *mockTryBufferStream) TryReceiveDatagramBuffer() (*quic.DatagramBuffer, error) {
+	m.tryCalls++
+	if len(m.tryObjects) == 0 {
+		return nil, context.Canceled
+	}
+	buffer := m.tryObjects[0]
+	m.tryObjects = m.tryObjects[1:]
+	return buffer, nil
 }
 
 func (m *mockReceiveBufferStream) ReceiveDatagramBuffer(ctx context.Context) (*quic.DatagramBuffer, error) {
@@ -222,6 +240,22 @@ func TestTryReadPacketBufferUnsupportedOnlyReturnsCanceled(t *testing.T) {
 	_, err := conn.TryReadPacketBuffer()
 	require.ErrorIs(t, err, context.Canceled)
 	require.Equal(t, 2, str.receiveCalls)
+}
+
+func TestTryReadPacketBufferUsesExplicitNonblockingAPI(t *testing.T) {
+	invalid := &quic.DatagramBuffer{Data: quicvarint.Append(nil, 1)}
+	valid := &quic.DatagramBuffer{Data: append(quicvarint.Append(nil, 0), incomingIPv4Packet()...)}
+	str := &mockTryBufferStream{tryObjects: []*quic.DatagramBuffer{invalid, valid}}
+	conn := newReceiveTestConn(str)
+
+	packet, err := conn.TryReadPacketBuffer()
+	require.NoError(t, err)
+	require.Equal(t, incomingIPv4Packet(), packet.Data)
+	require.Equal(t, 2, str.tryCalls)
+	require.Equal(t, 0, str.bufferCalls)
+	require.Nil(t, invalid.Data, "discarded queued datagram must be released")
+	packet.Release()
+	require.Nil(t, valid.Data)
 }
 
 func TestReadPacketBufferLegacyFallbackKeepsIPv4Payload(t *testing.T) {
@@ -541,6 +575,92 @@ func TestSendingDatagrams(t *testing.T) {
 		_, err := conn.composeDatagram(ipv6Header[:ipv6.HeaderLen-1])
 		require.ErrorContains(t, err, "connect-ip: IPv6 packet too short")
 	})
+}
+
+func independentIPv4HeaderChecksum(header []byte) uint16 {
+	var sum uint32
+	for i := 0; i < len(header); i += 2 {
+		if i == 10 {
+			continue
+		}
+		sum += uint32(binary.BigEndian.Uint16(header[i : i+2]))
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + sum>>16
+	}
+	return ^uint16(sum)
+}
+
+func TestComposeDatagramIPv4OptionsChecksum(t *testing.T) {
+	for _, ihl := range []int{24, 28} {
+		t.Run(fmt.Sprintf("IHL%d", ihl), func(t *testing.T) {
+			packet := make([]byte, ihl+3)
+			packet[0] = 0x40 | byte(ihl/4)
+			packet[2], packet[3] = byte(len(packet)>>8), byte(len(packet))
+			packet[8] = 64
+			packet[9] = 17
+			for i := ipv4.HeaderLen; i < ihl; i++ {
+				packet[i] = byte(0xa0 + i)
+			}
+			beforeOptions := append([]byte(nil), packet[ipv4.HeaderLen:ihl]...)
+			binary.BigEndian.PutUint16(packet[10:12], independentIPv4HeaderChecksum(packet[:ihl]))
+
+			conn := newBareConn(&mockStream{})
+			err := conn.composeDatagramInPlace(packet)
+			require.NoError(t, err)
+			require.Equal(t, byte(63), packet[8])
+			require.Equal(t, beforeOptions, packet[ipv4.HeaderLen:ihl])
+			var sum uint32
+			for i := 0; i < ihl; i += 2 {
+				sum += uint32(binary.BigEndian.Uint16(packet[i : i+2]))
+			}
+			for sum>>16 != 0 {
+				sum = (sum & 0xffff) + sum>>16
+			}
+			require.Equal(t, uint32(0xffff), sum)
+		})
+	}
+}
+
+func TestComposeDatagramIPv4IHL5StillWorks(t *testing.T) {
+	packet := make([]byte, ipv4.HeaderLen)
+	packet[0] = 0x45
+	packet[8] = 64
+	binary.BigEndian.PutUint16(packet[10:12], independentIPv4HeaderChecksum(packet))
+
+	err := newBareConn(&mockStream{}).composeDatagramInPlace(packet)
+	require.NoError(t, err)
+	require.Equal(t, byte(63), packet[8])
+	var sum uint32
+	for i := 0; i < len(packet); i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(packet[i : i+2]))
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + sum>>16
+	}
+	require.Equal(t, uint32(0xffff), sum)
+}
+
+func TestComposeDatagramRejectsMalformedIPv4IHL(t *testing.T) {
+	for name, packet := range map[string][]byte{
+		"too small": func() []byte {
+			p := make([]byte, ipv4.HeaderLen)
+			p[0], p[8] = 0x44, 64
+			return p
+		}(),
+		"truncated options": func() []byte {
+			p := make([]byte, ipv4.HeaderLen)
+			p[0], p[8] = 0x46, 64
+			return p
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			before := append([]byte(nil), packet...)
+			err := newBareConn(&mockStream{}).composeDatagramInPlace(packet)
+			require.Error(t, err)
+			require.Equal(t, before, packet)
+		})
+	}
 }
 
 func TestSendLargeDatagrams(t *testing.T) {
