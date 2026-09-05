@@ -75,11 +75,17 @@ func (m *mockStream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 type mockReceiveBufferStream struct {
 	mockStream
 	bufferDatagrams [][]byte
+	bufferObjects   []*quic.DatagramBuffer
 	bufferCalls     int
 }
 
 func (m *mockReceiveBufferStream) ReceiveDatagramBuffer(ctx context.Context) (*quic.DatagramBuffer, error) {
 	m.bufferCalls++
+	if len(m.bufferObjects) > 0 {
+		buffer := m.bufferObjects[0]
+		m.bufferObjects = m.bufferObjects[1:]
+		return buffer, nil
+	}
 	if len(m.bufferDatagrams) > 0 {
 		data := m.bufferDatagrams[0]
 		m.bufferDatagrams = m.bufferDatagrams[1:]
@@ -149,13 +155,28 @@ func BenchmarkReadPacketBufferBorrowed(b *testing.B) {
 	}
 }
 
-func TestPacketBufferReleaseOwnerOnce(t *testing.T) {
-	owner := new(countingOwner)
-	packet := &PacketBuffer{Data: []byte("payload"), release: owner}
+func TestPacketBufferIsQuicDatagramBufferView(t *testing.T) {
+	quicBuffer := &quic.DatagramBuffer{Data: []byte("payload")}
+	packet := (*PacketBuffer)(quicBuffer)
+	require.Same(t, quicBuffer, (*quic.DatagramBuffer)(packet))
 	packet.Release()
 	packet.Release()
-	require.EqualValues(t, 1, owner.releases.Load())
-	require.Nil(t, packet.release)
+	require.Nil(t, quicBuffer.Data)
+}
+
+func TestReadPacketBufferBorrowedReslicesSameHandle(t *testing.T) {
+	raw := append(quicvarint.Append(nil, 0), incomingIPv4Packet()...)
+	quicBuffer := &quic.DatagramBuffer{Data: raw}
+	str := &mockReceiveBufferStream{bufferObjects: []*quic.DatagramBuffer{quicBuffer}}
+	conn := newReceiveTestConn(str)
+
+	packet, err := conn.ReadPacketBuffer()
+	require.NoError(t, err)
+	require.Same(t, quicBuffer, (*quic.DatagramBuffer)(packet))
+	require.Equal(t, raw[1:], packet.Data)
+	require.Same(t, &raw[1], &packet.Data[0])
+	packet.Release()
+	require.Nil(t, quicBuffer.Data)
 }
 
 func TestReadPacketBufferStalePacketRegression(t *testing.T) {

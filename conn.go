@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/netip"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/exp/slices"
@@ -65,20 +64,15 @@ type http3OwnedBufferSender interface {
 // QUIC send queue only after that queue accepts the frame.
 type PacketPayloadOwner interface{ Release() }
 
-type PacketBuffer struct {
-	Data     []byte
-	release  PacketPayloadOwner
-	released atomic.Bool
-}
+// PacketBuffer is a named pointer view over quic.DatagramBuffer. The
+// buffer-aware receive path converts the pointer without allocating another
+// handle object. Release and its exactly-once semantics are owned by the QUIC
+// DatagramBuffer.
+type PacketBuffer quic.DatagramBuffer
 
 func (b *PacketBuffer) Release() {
-	if b == nil || !b.released.CompareAndSwap(false, true) {
-		return
-	}
-	owner := b.release
-	b.release = nil
-	if owner != nil {
-		owner.Release()
+	if b != nil {
+		(*quic.DatagramBuffer)(b).Release()
 	}
 }
 
@@ -325,57 +319,58 @@ func (c *Conn) TryReadPacketBuffer() (*PacketBuffer, error) {
 }
 
 func (c *Conn) readPacketBuffer(ctx context.Context) (*PacketBuffer, error) {
+	if s, ok := c.str.(http3BufferStream); ok {
+		return c.readBorrowedPacketBuffer(ctx, s)
+	}
+	return c.readLegacyPacketBuffer(ctx)
+}
+
+func (c *Conn) readBorrowedPacketBuffer(ctx context.Context, s http3BufferStream) (*PacketBuffer, error) {
 	for {
-		data, owner, err := c.receiveRawDatagram(ctx)
+		b, err := s.ReceiveDatagramBuffer(ctx)
 		if err != nil {
 			return nil, err
 		}
-		contextID, n, err := quicvarint.Parse(data)
+		contextID, n, err := quicvarint.Parse(b.Data)
 		if err != nil {
-			releasePacketOwner(owner)
+			b.Release()
 			return nil, fmt.Errorf("connect-ip: malformed datagram: %w", err)
 		}
 		if contextID != 0 {
-			releasePacketOwner(owner)
+			b.Release()
+			continue
+		}
+		if err := c.handleIncomingProxiedPacket(b.Data[n:]); err != nil {
+			b.Release()
+			continue
+		}
+		b.Data = b.Data[n:]
+		return (*PacketBuffer)(b), nil
+	}
+}
+
+func (c *Conn) readLegacyPacketBuffer(ctx context.Context) (*PacketBuffer, error) {
+	for {
+		data, err := c.str.ReceiveDatagram(ctx)
+		if err != nil {
+			select {
+			case <-c.closeChan:
+				return nil, c.closeErr
+			default:
+				return nil, err
+			}
+		}
+		contextID, n, err := quicvarint.Parse(data)
+		if err != nil {
+			return nil, fmt.Errorf("connect-ip: malformed datagram: %w", err)
+		}
+		if contextID != 0 {
 			continue
 		}
 		if err := c.handleIncomingProxiedPacket(data[n:]); err != nil {
-			releasePacketOwner(owner)
 			continue
 		}
-		if owner == nil {
-			return &PacketBuffer{Data: data[n:]}, nil
-		}
-		return &PacketBuffer{Data: data[n:], release: owner}, nil
-	}
-}
-
-// receiveRawDatagram returns one complete HTTP/3 DATAGRAM payload, including
-// the CONNECT-IP Context ID. The caller owns owner and must either release it
-// or transfer it to the returned PacketBuffer.
-func (c *Conn) receiveRawDatagram(ctx context.Context) (data []byte, owner interface{ Release() }, err error) {
-	if s, ok := c.str.(http3BufferStream); ok {
-		b, err := s.ReceiveDatagramBuffer(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
-		return b.Data, b, nil
-	}
-	data, err = c.str.ReceiveDatagram(ctx)
-	if err != nil {
-		select {
-		case <-c.closeChan:
-			return nil, nil, c.closeErr
-		default:
-			return nil, nil, err
-		}
-	}
-	return data, nil, nil
-}
-
-func releasePacketOwner(owner interface{ Release() }) {
-	if owner != nil {
-		owner.Release()
+		return &PacketBuffer{Data: data[n:]}, nil
 	}
 }
 
