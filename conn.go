@@ -115,23 +115,13 @@ func newProxiedConn(str http3Stream) *Conn {
 	go func() {
 		if err := c.readFromStream(); err != nil {
 			log.Printf("handling stream failed: %v", err)
-			c.mu.Lock()
-			if c.closeErr == nil {
-				c.closeErr = &CloseError{Remote: true}
-				close(c.closeChan)
-			}
-			c.mu.Unlock()
+			c.markClosed(true)
 		}
 	}()
 	go func() {
 		if err := c.writeToStream(); err != nil {
 			log.Printf("writing to stream failed: %v", err)
-			c.mu.Lock()
-			if c.closeErr == nil {
-				c.closeErr = &CloseError{Remote: true}
-				close(c.closeChan)
-			}
-			c.mu.Unlock()
+			c.markClosed(true)
 		}
 	}()
 	return c
@@ -180,7 +170,7 @@ func (c *Conn) sendCapsule(ctx context.Context, capsule appendable) error {
 			return err
 		}
 	case <-c.closeChan:
-		return c.closeErr
+		return c.closedError()
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -194,7 +184,7 @@ func (c *Conn) LocalPrefixes(ctx context.Context) ([]netip.Prefix, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-c.closeChan:
-		return nil, c.closeErr
+		return nil, c.closedError()
 	case <-c.assignedAddressNotify:
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -210,7 +200,7 @@ func (c *Conn) Routes(ctx context.Context) ([]IPRoute, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-c.closeChan:
-		return nil, c.closeErr
+		return nil, c.closedError()
 	case <-c.availableRoutesNotify:
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -273,14 +263,14 @@ func (c *Conn) writeToStream() error {
 	for {
 		select {
 		case <-c.closeChan:
-			return c.closeErr
+			return c.closedError()
 		case req, ok := <-c.writes:
 			if !ok {
 				return nil
 			}
 			buf = req.capsule.append(buf[:0])
 			_, err := c.str.Write(buf)
-			req.result <- err
+			req.result <- c.mapTransportError(err)
 			if err != nil {
 				return err
 			}
@@ -329,7 +319,7 @@ func (c *Conn) readBorrowedPacketBuffer(ctx context.Context, s http3BufferStream
 	for {
 		b, err := s.ReceiveDatagramBuffer(ctx)
 		if err != nil {
-			return nil, err
+			return nil, c.mapReceiveError(err)
 		}
 		contextID, n, err := quicvarint.Parse(b.Data)
 		if err != nil {
@@ -353,12 +343,7 @@ func (c *Conn) readLegacyPacketBuffer(ctx context.Context) (*PacketBuffer, error
 	for {
 		data, err := c.str.ReceiveDatagram(ctx)
 		if err != nil {
-			select {
-			case <-c.closeChan:
-				return nil, c.closeErr
-			default:
-				return nil, err
-			}
+			return nil, c.mapReceiveError(err)
 		}
 		contextID, n, err := quicvarint.Parse(data)
 		if err != nil {
@@ -479,9 +464,9 @@ func (c *Conn) WritePacket(b []byte) (icmp []byte, err error) {
 		}
 		select {
 		case <-c.closeChan:
-			return nil, c.closeErr
+			return nil, c.closedError()
 		default:
-			return nil, err
+			return nil, c.mapTransportError(err)
 		}
 	}
 	return nil, nil
@@ -514,7 +499,7 @@ func (c *Conn) WritePacketBuffer(buf []byte, offset, length int) (icmp []byte, e
 		if errors.As(err, &tooLarge) {
 			return composeICMPTooLargePacket(p, minMTU)
 		}
-		return nil, err
+		return nil, c.mapTransportError(err)
 	}
 	return nil, nil
 }
@@ -555,7 +540,7 @@ func (c *Conn) WritePacketBufferOwned(buf []byte, offset, length int, owner Pack
 		if errors.As(err, &tooLarge) {
 			return composeICMPTooLargePacket(p, minMTU)
 		}
-		return nil, err
+		return nil, c.mapTransportError(err)
 	}
 	// The legacy HTTP/3 fallback copies synchronously and doesn't transfer
 	// ownership itself. The owned sender does.
@@ -607,15 +592,75 @@ func (c *Conn) composeDatagramInPlace(b []byte) error {
 }
 
 func (c *Conn) Close() error {
-	c.mu.Lock()
-	if c.closeErr == nil {
-		c.closeErr = &CloseError{Remote: false}
-		close(c.closeChan)
+	_, first := c.markClosed(false)
+	if !first {
+		return nil
 	}
-	c.mu.Unlock()
 	c.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
-	err := c.str.Close()
-	return err
+	return c.str.Close()
+}
+
+// markClosed records the first terminal connection state and wakes all
+// blocked operations. The first caller wins, so a local Close cannot be
+// overwritten by a later transport error and remote shutdown is recorded once.
+func (c *Conn) markClosed(remote bool) (error, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closeErr != nil {
+		return c.closeErr, false
+	}
+	c.closeErr = &CloseError{Remote: remote}
+	close(c.closeChan)
+	return c.closeErr, true
+}
+
+func (c *Conn) closedError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closeErr
+}
+
+func (c *Conn) mapReceiveError(err error) error {
+	if closed := c.closedError(); closed != nil {
+		return closed
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return c.mapTransportError(err)
+}
+
+func (c *Conn) mapTransportError(err error) error {
+	if closed := c.closedError(); closed != nil {
+		return closed
+	}
+	if !isTerminalTransportError(err) {
+		return err
+	}
+	closed, _ := c.markClosed(true)
+	return closed
+}
+
+func isTerminalTransportError(err error) bool {
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+		return true
+	}
+	var (
+		appErr       *quic.ApplicationError
+		transportErr *quic.TransportError
+		streamErr    *quic.StreamError
+		statelessErr *quic.StatelessResetError
+		idleErr      *quic.IdleTimeoutError
+		handshakeErr *quic.HandshakeTimeoutError
+		h3Err        *http3.Error
+	)
+	return errors.As(err, &appErr) ||
+		errors.As(err, &transportErr) ||
+		errors.As(err, &streamErr) ||
+		errors.As(err, &statelessErr) ||
+		errors.As(err, &idleErr) ||
+		errors.As(err, &handshakeErr) ||
+		errors.As(err, &h3Err)
 }
 
 func ipVersion(b []byte) uint8 { return b[0] >> 4 }

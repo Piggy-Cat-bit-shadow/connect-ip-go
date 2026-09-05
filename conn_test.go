@@ -120,6 +120,16 @@ func newReceiveTestConn(str http3Stream) *Conn {
 	return conn
 }
 
+func newBareConn(str http3Stream) *Conn {
+	return &Conn{
+		str:                   str,
+		writes:                make(chan writeCapsule),
+		assignedAddressNotify: make(chan struct{}, 1),
+		availableRoutesNotify: make(chan struct{}, 1),
+		closeChan:             make(chan struct{}),
+	}
+}
+
 func TestReadPacketBufferDropsInvalidThenReceivesNext(t *testing.T) {
 	valid := append(quicvarint.Append(nil, 0), incomingIPv4Packet()...)
 	str := &mockReceiveBufferStream{bufferDatagrams: [][]byte{{0, 0x50}, valid}}
@@ -250,6 +260,59 @@ func TestReadPacketBufferMalformedContextReleasesAndReturnsError(t *testing.T) {
 	_, err := conn.ReadPacketBuffer()
 	require.ErrorContains(t, err, "connect-ip: malformed datagram")
 	require.Equal(t, 1, str.bufferCalls)
+}
+
+func TestReadPacketBufferMapsTerminalTransportError(t *testing.T) {
+	underlying := &quic.StreamError{Remote: true, ErrorCode: 42}
+	conn := &Conn{
+		str:       &mockReceiveBufferStream{mockStream: mockStream{receiveErr: underlying}},
+		closeChan: make(chan struct{}),
+	}
+
+	_, err := conn.ReadPacketBuffer()
+	var closeErr *CloseError
+	require.ErrorAs(t, err, &closeErr)
+	require.True(t, closeErr.Remote)
+	require.ErrorIs(t, err, net.ErrClosed)
+	require.NotEqual(t, underlying, err)
+}
+
+func TestReadPacketBufferPreservesNonTerminalErrors(t *testing.T) {
+	sentinel := errors.New("sentinel")
+	conn := &Conn{
+		str:       &mockReceiveBufferStream{mockStream: mockStream{receiveErr: sentinel}},
+		closeChan: make(chan struct{}),
+	}
+
+	_, err := conn.ReadPacketBuffer()
+	require.ErrorIs(t, err, sentinel)
+	var closeErr *CloseError
+	require.NotErrorAs(t, err, &closeErr)
+}
+
+func TestReadPacketBufferLocalCloseWinsOverUnderlyingError(t *testing.T) {
+	conn := &Conn{
+		str:       &mockReceiveBufferStream{mockStream: mockStream{receiveErr: &quic.StreamError{Remote: false, ErrorCode: 42}}},
+		closeChan: make(chan struct{}),
+	}
+	conn.markClosed(false)
+
+	_, err := conn.ReadPacketBuffer()
+	var closeErr *CloseError
+	require.ErrorAs(t, err, &closeErr)
+	require.False(t, closeErr.Remote)
+}
+
+func TestCloseIsIdempotentAndKeepsLocalState(t *testing.T) {
+	conn := &Conn{
+		str:       &mockStream{},
+		closeChan: make(chan struct{}),
+	}
+	require.NoError(t, conn.Close())
+	require.NoError(t, conn.Close())
+	closeErr, ok := conn.closedError().(*CloseError)
+	require.True(t, ok)
+	require.False(t, closeErr.Remote)
 }
 
 func TestIncomingDatagrams(t *testing.T) {
@@ -608,5 +671,18 @@ func TestWritePacketBufferOwnedReleasesOnSendError(t *testing.T) {
 	owner := new(countingOwner)
 	_, err := conn.WritePacketBufferOwned(buf, 9, len(ip), owner)
 	require.NoError(t, err, "too-large errors are converted to ICMP")
+	require.EqualValues(t, 1, owner.releases.Load())
+}
+
+func TestWritePacketBufferOwnedMapsTerminalErrorAndReleasesOwner(t *testing.T) {
+	str := &mockOwnedBufferStream{mockBufferStream: mockBufferStream{mockStream: mockStream{sendDatagramErr: &quic.StreamError{Remote: true, ErrorCode: 42}}}}
+	conn := newBareConn(str)
+	ip := testIPv4Packet(t)
+	buf := make([]byte, 9+len(ip))
+	copy(buf[9:], ip)
+	owner := new(countingOwner)
+
+	_, err := conn.WritePacketBufferOwned(buf, 9, len(ip), owner)
+	require.ErrorIs(t, err, net.ErrClosed)
 	require.EqualValues(t, 1, owner.releases.Load())
 }
