@@ -126,6 +126,38 @@ func TestReadPacketBufferDropsInvalidThenReceivesNext(t *testing.T) {
 	p.Release()
 }
 
+type benchmarkReceiveBufferStream struct {
+	mockStream
+	data []byte
+}
+
+func (s *benchmarkReceiveBufferStream) ReceiveDatagramBuffer(context.Context) (*quic.DatagramBuffer, error) {
+	return &quic.DatagramBuffer{Data: s.data}, nil
+}
+
+func BenchmarkReadPacketBufferBorrowed(b *testing.B) {
+	data := append(quicvarint.Append(nil, 0), incomingIPv4Packet()...)
+	conn := newReceiveTestConn(&benchmarkReceiveBufferStream{data: data})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		packet, err := conn.ReadPacketBuffer()
+		if err != nil {
+			b.Fatal(err)
+		}
+		packet.Release()
+	}
+}
+
+func TestPacketBufferReleaseOwnerOnce(t *testing.T) {
+	owner := new(countingOwner)
+	packet := &PacketBuffer{Data: []byte("payload"), release: owner}
+	packet.Release()
+	packet.Release()
+	require.EqualValues(t, 1, owner.releases.Load())
+	require.Nil(t, packet.release)
+}
+
 func TestReadPacketBufferStalePacketRegression(t *testing.T) {
 	secondReceive := errors.New("second receive")
 	str := &mockStream{receivedDatagrams: [][]byte{{0, 0x50}}, receiveErr: secondReceive}

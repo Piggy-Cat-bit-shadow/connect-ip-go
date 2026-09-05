@@ -67,13 +67,18 @@ type PacketPayloadOwner interface{ Release() }
 
 type PacketBuffer struct {
 	Data     []byte
-	release  func()
+	release  PacketPayloadOwner
 	released atomic.Bool
 }
 
 func (b *PacketBuffer) Release() {
-	if b != nil && b.released.CompareAndSwap(false, true) && b.release != nil {
-		b.release()
+	if b == nil || !b.released.CompareAndSwap(false, true) {
+		return
+	}
+	owner := b.release
+	b.release = nil
+	if owner != nil {
+		owner.Release()
 	}
 }
 
@@ -341,7 +346,7 @@ func (c *Conn) readPacketBuffer(ctx context.Context) (*PacketBuffer, error) {
 		if owner == nil {
 			return &PacketBuffer{Data: data[n:]}, nil
 		}
-		return &PacketBuffer{Data: data[n:], release: owner.Release}, nil
+		return &PacketBuffer{Data: data[n:], release: owner}, nil
 	}
 }
 
