@@ -320,45 +320,57 @@ func (c *Conn) TryReadPacketBuffer() (*PacketBuffer, error) {
 }
 
 func (c *Conn) readPacketBuffer(ctx context.Context) (*PacketBuffer, error) {
-	var data []byte
-	var owner interface{ Release() }
-	if s, ok := c.str.(http3BufferStream); ok {
-		b, err := s.ReceiveDatagramBuffer(ctx)
-		if err != nil {
-			return nil, err
-		}
-		data, owner = b.Data, b
-	} else {
-		b, err := c.readPacket(ctx)
-		if err != nil {
-			return nil, err
-		}
-		data = append([]byte(nil), b...)
-	}
 	for {
+		data, owner, err := c.receiveRawDatagram(ctx)
+		if err != nil {
+			return nil, err
+		}
 		contextID, n, err := quicvarint.Parse(data)
 		if err != nil {
-			if owner != nil {
-				owner.Release()
-			}
+			releasePacketOwner(owner)
 			return nil, fmt.Errorf("connect-ip: malformed datagram: %w", err)
 		}
 		if contextID != 0 {
-			if owner != nil {
-				owner.Release()
-			}
-			return c.readPacketBuffer(ctx)
+			releasePacketOwner(owner)
+			continue
 		}
 		if err := c.handleIncomingProxiedPacket(data[n:]); err != nil {
-			if owner != nil {
-				owner.Release()
-			}
+			releasePacketOwner(owner)
 			continue
 		}
 		if owner == nil {
 			return &PacketBuffer{Data: data[n:]}, nil
 		}
 		return &PacketBuffer{Data: data[n:], release: owner.Release}, nil
+	}
+}
+
+// receiveRawDatagram returns one complete HTTP/3 DATAGRAM payload, including
+// the CONNECT-IP Context ID. The caller owns owner and must either release it
+// or transfer it to the returned PacketBuffer.
+func (c *Conn) receiveRawDatagram(ctx context.Context) (data []byte, owner interface{ Release() }, err error) {
+	if s, ok := c.str.(http3BufferStream); ok {
+		b, err := s.ReceiveDatagramBuffer(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		return b.Data, b, nil
+	}
+	data, err = c.str.ReceiveDatagram(ctx)
+	if err != nil {
+		select {
+		case <-c.closeChan:
+			return nil, nil, c.closeErr
+		default:
+			return nil, nil, err
+		}
+	}
+	return data, nil, nil
+}
+
+func releasePacketOwner(owner interface{ Release() }) {
+	if owner != nil {
+		owner.Release()
 	}
 }
 
@@ -377,33 +389,6 @@ var canceledDone = func() <-chan struct{} {
 	close(ch)
 	return ch
 }()
-
-func (c *Conn) readPacket(ctx context.Context) (b []byte, err error) {
-start:
-	data, err := c.str.ReceiveDatagram(ctx)
-	if err != nil {
-		select {
-		case <-c.closeChan:
-			return nil, c.closeErr
-		default:
-			return nil, err
-		}
-	}
-	contextID, n, err := quicvarint.Parse(data)
-	if err != nil {
-		// TODO: close connection
-		return nil, fmt.Errorf("connect-ip: malformed datagram: %w", err)
-	}
-	if contextID != 0 {
-		// Drop this datagram. We currently only support proxying of IP payloads.
-		goto start
-	}
-	if err := c.handleIncomingProxiedPacket(data[n:]); err != nil {
-		log.Printf("dropping proxied packet: %s", err)
-		goto start
-	}
-	return data[n:], nil
-}
 
 func (c *Conn) handleIncomingProxiedPacket(data []byte) error {
 	if len(data) == 0 {

@@ -2,6 +2,7 @@ package connectip
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"sync/atomic"
@@ -25,10 +26,13 @@ var ipv6Header = []byte{
 }
 
 type mockStream struct {
-	reading         []byte
-	toRead          <-chan []byte
-	sendDatagramErr error
-	sentDatagrams   [][]byte
+	reading           []byte
+	toRead            <-chan []byte
+	sendDatagramErr   error
+	sentDatagrams     [][]byte
+	receivedDatagrams [][]byte
+	receiveCalls      int
+	receiveErr        error
 }
 
 var _ http3Stream = &mockStream{}
@@ -55,8 +59,144 @@ func (m *mockStream) SendDatagram(data []byte) error {
 	return m.sendDatagramErr
 }
 func (m *mockStream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+	m.receiveCalls++
+	if len(m.receivedDatagrams) > 0 {
+		data := m.receivedDatagrams[0]
+		m.receivedDatagrams = m.receivedDatagrams[1:]
+		return data, nil
+	}
+	if m.receiveErr != nil {
+		return nil, m.receiveErr
+	}
 	<-ctx.Done()
 	return nil, ctx.Err()
+}
+
+type mockReceiveBufferStream struct {
+	mockStream
+	bufferDatagrams [][]byte
+	bufferCalls     int
+}
+
+func (m *mockReceiveBufferStream) ReceiveDatagramBuffer(ctx context.Context) (*quic.DatagramBuffer, error) {
+	m.bufferCalls++
+	if len(m.bufferDatagrams) > 0 {
+		data := m.bufferDatagrams[0]
+		m.bufferDatagrams = m.bufferDatagrams[1:]
+		return &quic.DatagramBuffer{Data: data}, nil
+	}
+	if m.receiveErr != nil {
+		return nil, m.receiveErr
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func incomingIPv4Packet() []byte {
+	data, err := (&ipv4.Header{
+		Version:  4,
+		Len:      20,
+		TTL:      64,
+		Src:      net.IPv4(192, 168, 0, 10),
+		Dst:      net.IPv4(10, 0, 0, 1),
+		Protocol: 17,
+	}).Marshal()
+	if err != nil {
+		panic(err)
+	}
+	return data
+}
+
+func newReceiveTestConn(str http3Stream) *Conn {
+	conn := newProxiedConn(str)
+	conn.peerAddresses = []netip.Prefix{netip.MustParsePrefix("192.168.0.10/32")}
+	conn.localRoutes = []IPRoute{{StartIP: netip.MustParseAddr("10.0.0.0"), EndIP: netip.MustParseAddr("10.0.0.255")}}
+	return conn
+}
+
+func TestReadPacketBufferDropsInvalidThenReceivesNext(t *testing.T) {
+	valid := append(quicvarint.Append(nil, 0), incomingIPv4Packet()...)
+	str := &mockReceiveBufferStream{bufferDatagrams: [][]byte{{0, 0x50}, valid}}
+	conn := newReceiveTestConn(str)
+
+	p, err := conn.ReadPacketBuffer()
+	require.NoError(t, err)
+	require.Equal(t, incomingIPv4Packet(), p.Data)
+	require.Equal(t, 2, str.bufferCalls)
+	p.Release()
+}
+
+func TestReadPacketBufferStalePacketRegression(t *testing.T) {
+	secondReceive := errors.New("second receive")
+	str := &mockStream{receivedDatagrams: [][]byte{{0, 0x50}}, receiveErr: secondReceive}
+	conn := newReceiveTestConn(str)
+
+	_, err := conn.ReadPacketBuffer()
+	require.ErrorIs(t, err, secondReceive)
+	require.Equal(t, 2, str.receiveCalls)
+}
+
+func TestReadPacketBufferIteratesUnsupportedContexts(t *testing.T) {
+	const unsupported = 10000
+	str := &mockStream{receivedDatagrams: make([][]byte, 0, unsupported+1)}
+	for i := 0; i < unsupported; i++ {
+		str.receivedDatagrams = append(str.receivedDatagrams, quicvarint.Append(nil, 1))
+	}
+	valid := append(quicvarint.Append(nil, 0), incomingIPv4Packet()...)
+	str.receivedDatagrams = append(str.receivedDatagrams, valid)
+	conn := newReceiveTestConn(str)
+
+	p, err := conn.ReadPacketBuffer()
+	require.NoError(t, err)
+	require.Equal(t, unsupported+1, str.receiveCalls)
+	p.Release()
+}
+
+func TestTryReadPacketBufferUnsupportedOnlyReturnsCanceled(t *testing.T) {
+	str := &mockStream{receivedDatagrams: [][]byte{quicvarint.Append(nil, 1)}}
+	conn := newReceiveTestConn(str)
+
+	_, err := conn.TryReadPacketBuffer()
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 2, str.receiveCalls)
+}
+
+func TestReadPacketBufferLegacyFallbackKeepsIPv4Payload(t *testing.T) {
+	ip := incomingIPv4Packet()
+	raw := append(quicvarint.Append(nil, 0), ip...)
+	str := &mockStream{receivedDatagrams: [][]byte{raw}}
+	conn := newReceiveTestConn(str)
+
+	p, err := conn.ReadPacketBuffer()
+	require.NoError(t, err)
+	require.Equal(t, ip, p.Data)
+	require.Equal(t, &raw[1], &p.Data[0], "legacy fallback must return a reslice, not parse a second time")
+	p.Release()
+}
+
+func TestReadPacketBufferLegacyFallbackKeepsIPv6Payload(t *testing.T) {
+	ip := append([]byte(nil), ipv6Header...)
+	dst := netip.MustParseAddr("2001:db8:1::1").As16()
+	copy(ip[24:40], dst[:])
+	raw := append(quicvarint.Append(nil, 0), ip...)
+	str := &mockStream{receivedDatagrams: [][]byte{raw}}
+	conn := newProxiedConn(str)
+	conn.peerAddresses = []netip.Prefix{netip.MustParsePrefix("2001:db8::1/128")}
+	conn.localRoutes = []IPRoute{{StartIP: netip.MustParseAddr("2001:db8:1::"), EndIP: netip.MustParseAddr("2001:db8:1::ffff")}}
+
+	p, err := conn.ReadPacketBuffer()
+	require.NoError(t, err)
+	require.Equal(t, ip, p.Data)
+	p.Release()
+}
+
+func TestReadPacketBufferMalformedContextReleasesAndReturnsError(t *testing.T) {
+	str := &mockReceiveBufferStream{bufferDatagrams: [][]byte{{0xff}}}
+	conn := newReceiveTestConn(str)
+
+	_, err := conn.ReadPacketBuffer()
+	require.ErrorContains(t, err, "connect-ip: malformed datagram")
+	require.Equal(t, 1, str.bufferCalls)
 }
 
 func TestIncomingDatagrams(t *testing.T) {
