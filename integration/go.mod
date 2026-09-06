@@ -2,7 +2,7 @@ module github.com/quic-go/connect-ip-go/integration
 
 go 1.26.0
 
-replace github.com/quic-go/connect-ip-go => github.com/Piggy-Cat-bit-shadow/connect-ip-go v0.0.0-20260906031748-d4db624bc4a8
+replace github.com/quic-go/connect-ip-go => github.com/Piggy-Cat-bit-shadow/connect-ip-go v0.0.0-20260906032003-4b59e688175a
 
 replace github.com/metacubex/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260906031434-26f04c632d35
 
