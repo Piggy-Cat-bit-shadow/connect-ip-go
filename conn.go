@@ -630,7 +630,14 @@ func (c *Conn) WritePacketBuffer(buf []byte, offset, length int) ([]byte, error)
 		}
 		return nil, nil
 	}
-	return c.WritePacket(buf[dataOffset : dataOffset+dataLength])
+	if err := c.str.SendDatagram(buf[dataOffset : dataOffset+dataLength]); err != nil {
+		var tooLarge *quic.DatagramTooLargeError
+		if errors.As(err, &tooLarge) {
+			return composeICMPTooLargePacket(p, minMTU)
+		}
+		return nil, c.mapPacketError(err)
+	}
+	return nil, nil
 }
 
 // WritePacketBufferOwned transfers ownership only when the lower layer
@@ -660,7 +667,7 @@ func (c *Conn) WritePacketBufferOwned(buf []byte, offset, length int, owner Pack
 	} else if sender, ok := c.str.(http3BufferSender); ok {
 		err = sender.SendDatagramBuffer(buf, dataOffset, dataLength)
 	} else {
-		_, err = c.WritePacket(buf[dataOffset : dataOffset+dataLength])
+		err = c.str.SendDatagram(buf[dataOffset : dataOffset+dataLength])
 	}
 	if err != nil {
 		var tooLarge *quic.DatagramTooLargeError
@@ -673,33 +680,8 @@ func (c *Conn) WritePacketBufferOwned(buf []byte, offset, length int, owner Pack
 }
 
 func (c *Conn) composeDatagram(b []byte) ([]byte, error) {
-	// TODO: implement src, dst and ipproto checks
-	if len(b) == 0 {
-		return nil, nil
-	}
-	switch v := ipVersion(b); v {
-	default:
-		return nil, fmt.Errorf("connect-ip: unknown IP versions: %d", v)
-	case 4:
-		if len(b) < ipv4.HeaderLen {
-			return nil, fmt.Errorf("connect-ip: IPv4 packet too short")
-		}
-		ttl := b[8]
-		if ttl <= 1 {
-			return nil, fmt.Errorf("connect-ip: datagram TTL too small: %d", ttl)
-		}
-		b[8]-- // decrement TTL
-		// recalculate the checksum
-		binary.BigEndian.PutUint16(b[10:12], calculateIPv4Checksum(([ipv4.HeaderLen]byte)(b[:ipv4.HeaderLen])))
-	case 6:
-		if len(b) < ipv6.HeaderLen {
-			return nil, fmt.Errorf("connect-ip: IPv6 packet too short")
-		}
-		hopLimit := b[7]
-		if hopLimit <= 1 {
-			return nil, fmt.Errorf("connect-ip: datagram Hop Limit too small: %d", hopLimit)
-		}
-		b[7]-- // Decrement Hop Limit
+	if err := c.composeDatagramInPlace(b); err != nil {
+		return nil, err
 	}
 	data := make([]byte, 0, len(contextIDZero)+len(b))
 	data = append(data, contextIDZero...)
@@ -728,9 +710,7 @@ func (c *Conn) composeDatagramInPlace(b []byte) error {
 			return fmt.Errorf("connect-ip: datagram TTL too small: %d", b[8])
 		}
 		b[8]--
-		var header [ipv4.HeaderLen]byte
-		copy(header[:], b[:ipv4.HeaderLen])
-		binary.BigEndian.PutUint16(b[10:12], calculateIPv4Checksum(header))
+		binary.BigEndian.PutUint16(b[10:12], calculateIPv4ChecksumBytes(b[:ihl]))
 	case 6:
 		if len(b) < ipv6.HeaderLen {
 			return fmt.Errorf("connect-ip: IPv6 packet too short")
