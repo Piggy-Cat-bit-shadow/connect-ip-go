@@ -86,7 +86,7 @@ func TestAddressAssignment(t *testing.T) {
 	_, err := server.Routes(ctx)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 
-	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel = context.WithTimeout(context.Background(), testDuration(time.Second))
 	defer cancel()
 	pref1 := netip.MustParsePrefix("1.1.1.0/24")
 	pref2 := netip.MustParsePrefix("2001:db8::/64")
@@ -111,7 +111,7 @@ func TestRouteAdvertisement(t *testing.T) {
 	_, err := server.Routes(ctx)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 
-	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel = context.WithTimeout(context.Background(), testDuration(time.Second))
 	defer cancel()
 
 	// refuse to advertise invalid routes
