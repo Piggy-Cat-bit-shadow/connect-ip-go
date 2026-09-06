@@ -3,8 +3,11 @@ package connectip
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +21,85 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestNormalizeTerminalPacketErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{"ApplicationError", &quic.ApplicationError{Remote: true}},
+		{"TransportError", &quic.TransportError{Remote: true}},
+		{"StreamError", &quic.StreamError{Remote: true}},
+		{"StatelessResetError", &quic.StatelessResetError{}},
+		{"IdleTimeoutError", &quic.IdleTimeoutError{}},
+		{"HandshakeTimeoutError", &quic.HandshakeTimeoutError{}},
+		{"HTTP3Error", &http3.Error{Remote: true}},
+		{"ErrClosed", net.ErrClosed},
+		{"EOF", io.EOF},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Conn{closeChan: make(chan struct{})}
+			err := c.mapPacketError(tt.err)
+			var closeErr *CloseError
+			require.ErrorAs(t, err, &closeErr)
+			require.True(t, errors.Is(err, net.ErrClosed))
+			require.True(t, closeErr.Remote)
+			select {
+			case <-c.closeChan:
+			default:
+				t.Fatal("terminal error did not close connection")
+			}
+			require.Same(t, err, c.closeErr)
+		})
+	}
+}
+
+func TestNormalizePacketErrorsPreservesContextErrors(t *testing.T) {
+	for _, err := range []error{context.Canceled, context.DeadlineExceeded} {
+		c := &Conn{closeChan: make(chan struct{})}
+		require.ErrorIs(t, c.mapPacketError(err), err)
+		select {
+		case <-c.closeChan:
+			t.Fatal("non-terminal context error closed connection")
+		default:
+		}
+	}
+}
+
+func TestTerminalCloseFirstStateWins(t *testing.T) {
+	localFirst := &Conn{closeChan: make(chan struct{})}
+	local := &CloseError{Remote: false}
+	localFirst.markClosedError(local, false)
+	localFirst.markClosedError(&quic.ApplicationError{Remote: true}, true)
+	var got *CloseError
+	require.ErrorAs(t, localFirst.closeErr, &got)
+	require.False(t, got.Remote)
+
+	remoteFirst := &Conn{closeChan: make(chan struct{})}
+	remoteFirst.markClosedError(&quic.TransportError{Remote: true}, true)
+	remoteFirst.markClosedError(local, false)
+	require.ErrorAs(t, remoteFirst.closeErr, &got)
+	require.True(t, got.Remote)
+
+	concurrent := &Conn{closeChan: make(chan struct{})}
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			concurrent.markClosedError(&quic.ApplicationError{Remote: true}, true)
+		}()
+	}
+	wg.Wait()
+	require.ErrorAs(t, concurrent.closeErr, &got)
+	require.True(t, got.Remote)
+	select {
+	case <-concurrent.closeChan:
+	default:
+		t.Fatal("concurrent terminal errors did not close connection")
+	}
+}
 
 var ipv6Header = []byte{
 	0x60, 0x00, 0x00, 0x00, // Version, Traffic Class, Flow Label

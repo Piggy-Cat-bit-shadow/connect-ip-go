@@ -26,6 +26,14 @@ jobs:
             echo "::error::Found ignored Go files: $IGNORED_FILES"
             exit 1
           fi
+      - name: Reject local filesystem module replacements
+        if: matrix.module == '.'
+        working-directory: ${{ matrix.module }}
+        run: |
+          if awk '/^replace \(/,/^\)/ { print } /^replace [^ ]+ =>/ { print }' go.mod | grep -E '=>[[:space:]]*(/|\.\.?/|[A-Za-z]:[\\/])'; then
+            echo "::error::go.mod contains a local filesystem replacement"
+            exit 1
+          fi
       - name: Check that go.mod is tidied
         if: success() || failure() # run this step even if the previous one failed
         working-directory: ${{ matrix.module }}

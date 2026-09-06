@@ -118,23 +118,13 @@ func newProxiedConn(str http3Stream, closeConn func() error) *Conn {
 	go func() {
 		if err := c.readFromStream(); err != nil {
 			log.Printf("handling stream failed: %v", err)
-			c.mu.Lock()
-			if c.closeErr == nil {
-				c.closeErr = &CloseError{Remote: true}
-				close(c.closeChan)
-			}
-			c.mu.Unlock()
+			c.markClosedError(err, true)
 		}
 	}()
 	go func() {
 		if err := c.writeToStream(); err != nil {
 			log.Printf("writing to stream failed: %v", err)
-			c.mu.Lock()
-			if c.closeErr == nil {
-				c.closeErr = &CloseError{Remote: true}
-				close(c.closeChan)
-			}
-			c.mu.Unlock()
+			c.markClosedError(err, true)
 		}
 	}()
 	return c
@@ -500,18 +490,71 @@ func (c *Conn) TryReadPacketBuffer() (*PacketBuffer, error) {
 }
 
 func (c *Conn) mapPacketError(err error) error {
-	select {
-	case <-c.closeChan:
-		if c.closeErr != nil {
-			return c.closeErr
-		}
-	default:
+	if normalized, terminal := normalizeTerminalError(err); terminal {
+		return c.markClosedError(normalized, true)
 	}
-	var streamErr *quic.StreamError
-	if errors.As(err, &streamErr) {
-		return &CloseError{Remote: streamErr.Remote}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closeErr != nil {
+		return c.closeErr
 	}
 	return err
+}
+
+// normalizeTerminalError maps transport-level shutdowns to the stable error
+// contract exposed by CONNECT-IP. It intentionally leaves context and other
+// non-terminal errors untouched.
+func normalizeTerminalError(err error) (error, bool) {
+	if err == nil {
+		return nil, false
+	}
+	var (
+		closeErr     *CloseError
+		appErr       *quic.ApplicationError
+		transportErr *quic.TransportError
+		streamErr    *quic.StreamError
+		resetErr     *quic.StatelessResetError
+		idleErr      *quic.IdleTimeoutError
+		handshakeErr *quic.HandshakeTimeoutError
+		h3Err        *http3.Error
+	)
+	switch {
+	case errors.As(err, &closeErr):
+		return closeErr, true
+	case errors.As(err, &appErr):
+		return &CloseError{Remote: appErr.Remote}, true
+	case errors.As(err, &transportErr):
+		return &CloseError{Remote: transportErr.Remote}, true
+	case errors.As(err, &streamErr):
+		return &CloseError{Remote: streamErr.Remote}, true
+	case errors.As(err, &resetErr), errors.As(err, &idleErr), errors.As(err, &handshakeErr):
+		return &CloseError{Remote: true}, true
+	case errors.As(err, &h3Err):
+		return &CloseError{Remote: h3Err.Remote}, true
+	case errors.Is(err, net.ErrClosed), errors.Is(err, io.EOF):
+		return &CloseError{Remote: true}, true
+	default:
+		return err, false
+	}
+}
+
+// markClosedError records the first terminal state and wakes all blocked
+// operations. The caller may safely race with Close and other transport
+// failures; the first state remains authoritative.
+func (c *Conn) markClosedError(err error, remote bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closeErr == nil {
+		if normalized, terminal := normalizeTerminalError(err); terminal {
+			c.closeErr = normalized
+		} else if err != nil {
+			c.closeErr = err
+		} else {
+			c.closeErr = &CloseError{Remote: remote}
+		}
+		close(c.closeChan)
+	}
+	return c.closeErr
 }
 
 func (c *Conn) handleIncomingProxiedPacket(data []byte) error {
@@ -726,11 +769,8 @@ func (c *Conn) composeDatagramInPlace(b []byte) error {
 }
 
 func (c *Conn) Close() error {
+	c.markClosedError(&CloseError{Remote: false}, false)
 	c.mu.Lock()
-	if c.closeErr == nil {
-		c.closeErr = &CloseError{Remote: false}
-		close(c.closeChan)
-	}
 	closeConn := c.closeConn
 	c.closeConn = nil
 	c.mu.Unlock()
