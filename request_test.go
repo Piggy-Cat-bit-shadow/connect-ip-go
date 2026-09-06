@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/dunglas/httpsfv"
-	"github.com/quic-go/quic-go/http3"
+	"github.com/metacubex/quic-go/http3"
 	"github.com/stretchr/testify/require"
 	"github.com/yosida95/uritemplate/v3"
 )

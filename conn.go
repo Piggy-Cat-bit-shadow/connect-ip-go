@@ -15,9 +15,9 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
-	"github.com/quic-go/quic-go/quicvarint"
+	"github.com/metacubex/quic-go"
+	"github.com/metacubex/quic-go/http3"
+	"github.com/metacubex/quic-go/quicvarint"
 )
 
 type CloseError struct {
@@ -37,6 +37,34 @@ type http3Stream interface {
 	ReceiveDatagram(context.Context) ([]byte, error)
 	SendDatagram([]byte) error
 	CancelRead(quic.StreamErrorCode)
+}
+
+type http3BufferStream interface {
+	ReceiveDatagramBuffer(context.Context) (*quic.DatagramBuffer, error)
+}
+
+type http3TryBufferStream interface {
+	TryReceiveDatagramBuffer() (*quic.DatagramBuffer, error)
+}
+
+type http3BufferSender interface {
+	SendDatagramBuffer([]byte, int, int) error
+}
+
+type http3OwnedBufferSender interface {
+	SendDatagramBufferOwned([]byte, int, int, quic.DatagramPayloadOwner) error
+}
+
+// PacketPayloadOwner owns the backing storage passed to WritePacketBufferOwned.
+type PacketPayloadOwner interface{ Release() }
+
+// PacketBuffer is a zero-copy view over a QUIC datagram buffer.
+type PacketBuffer quic.DatagramBuffer
+
+func (b *PacketBuffer) Release() {
+	if b != nil {
+		(*quic.DatagramBuffer)(b).Release()
+	}
 }
 
 var (
@@ -408,6 +436,84 @@ start:
 	return copy(b, data[n:]), nil
 }
 
+// ReadPacketBuffer receives one validated IP packet without copying its
+// backing buffer. The caller must release the returned buffer.
+func (c *Conn) ReadPacketBuffer() (*PacketBuffer, error) {
+	if s, ok := c.str.(http3BufferStream); ok {
+		for {
+			b, err := s.ReceiveDatagramBuffer(context.Background())
+			if err != nil {
+				return nil, c.mapPacketError(err)
+			}
+			contextID, n, err := quicvarint.Parse(b.Data)
+			if err != nil {
+				b.Release()
+				return nil, fmt.Errorf("connect-ip: malformed datagram: %w", err)
+			}
+			if contextID != 0 || c.handleIncomingProxiedPacket(b.Data[n:]) != nil {
+				b.Release()
+				continue
+			}
+			b.Data = b.Data[n:]
+			return (*PacketBuffer)(b), nil
+		}
+	}
+	for {
+		data, err := c.str.ReceiveDatagram(context.Background())
+		if err != nil {
+			return nil, c.mapPacketError(err)
+		}
+		contextID, n, err := quicvarint.Parse(data)
+		if err != nil {
+			return nil, fmt.Errorf("connect-ip: malformed datagram: %w", err)
+		}
+		if contextID != 0 || c.handleIncomingProxiedPacket(data[n:]) != nil {
+			continue
+		}
+		return (*PacketBuffer)(&quic.DatagramBuffer{Data: data[n:]}), nil
+	}
+}
+
+// TryReadPacketBuffer drains one already queued datagram without waiting.
+func (c *Conn) TryReadPacketBuffer() (*PacketBuffer, error) {
+	s, ok := c.str.(http3TryBufferStream)
+	if !ok {
+		return nil, context.Canceled
+	}
+	for {
+		b, err := s.TryReceiveDatagramBuffer()
+		if err != nil {
+			return nil, c.mapPacketError(err)
+		}
+		contextID, n, err := quicvarint.Parse(b.Data)
+		if err != nil {
+			b.Release()
+			return nil, fmt.Errorf("connect-ip: malformed datagram: %w", err)
+		}
+		if contextID != 0 || c.handleIncomingProxiedPacket(b.Data[n:]) != nil {
+			b.Release()
+			continue
+		}
+		b.Data = b.Data[n:]
+		return (*PacketBuffer)(b), nil
+	}
+}
+
+func (c *Conn) mapPacketError(err error) error {
+	select {
+	case <-c.closeChan:
+		if c.closeErr != nil {
+			return c.closeErr
+		}
+	default:
+	}
+	var streamErr *quic.StreamError
+	if errors.As(err, &streamErr) {
+		return &CloseError{Remote: streamErr.Remote}
+	}
+	return err
+}
+
 func (c *Conn) handleIncomingProxiedPacket(data []byte) error {
 	if len(data) == 0 {
 		return errors.New("connect-ip: empty packet")
@@ -504,6 +610,68 @@ func (c *Conn) WritePacket(b []byte) (icmp []byte, err error) {
 	return nil, nil
 }
 
+// WritePacketBuffer sends an IP packet from a caller-provided buffer with
+// room for the CONNECT-IP context ID immediately before offset.
+func (c *Conn) WritePacketBuffer(buf []byte, offset, length int) ([]byte, error) {
+	if offset < len(contextIDZero) || offset > len(buf) || length < 0 || length > len(buf)-offset {
+		return nil, fmt.Errorf("connect-ip: invalid packet buffer range: offset=%d length=%d buffer=%d", offset, length, len(buf))
+	}
+	p := buf[offset : offset+length]
+	if err := c.composeDatagramInPlace(p); err != nil {
+		return nil, nil
+	}
+	copy(buf[offset-len(contextIDZero):offset], contextIDZero)
+	dataOffset := offset - len(contextIDZero)
+	dataLength := length + len(contextIDZero)
+	if sender, ok := c.str.(http3BufferSender); ok {
+		err := sender.SendDatagramBuffer(buf, dataOffset, dataLength)
+		if err != nil {
+			return nil, c.mapPacketError(err)
+		}
+		return nil, nil
+	}
+	return c.WritePacket(buf[dataOffset : dataOffset+dataLength])
+}
+
+// WritePacketBufferOwned transfers ownership only when the lower layer
+// accepts the owned send. All rejected or synchronous fallback paths release it.
+func (c *Conn) WritePacketBufferOwned(buf []byte, offset, length int, owner PacketPayloadOwner) (icmp []byte, err error) {
+	transferred := false
+	defer func() {
+		if !transferred && owner != nil {
+			owner.Release()
+		}
+	}()
+	if offset < len(contextIDZero) || offset > len(buf) || length < 0 || length > len(buf)-offset {
+		return nil, fmt.Errorf("connect-ip: invalid packet buffer range: offset=%d length=%d buffer=%d", offset, length, len(buf))
+	}
+	p := buf[offset : offset+length]
+	if err := c.composeDatagramInPlace(p); err != nil {
+		return nil, nil
+	}
+	copy(buf[offset-len(contextIDZero):offset], contextIDZero)
+	dataOffset := offset - len(contextIDZero)
+	dataLength := length + len(contextIDZero)
+	if sender, ok := c.str.(http3OwnedBufferSender); ok {
+		err = sender.SendDatagramBufferOwned(buf, dataOffset, dataLength, owner)
+		if err == nil {
+			transferred = true
+		}
+	} else if sender, ok := c.str.(http3BufferSender); ok {
+		err = sender.SendDatagramBuffer(buf, dataOffset, dataLength)
+	} else {
+		_, err = c.WritePacket(buf[dataOffset : dataOffset+dataLength])
+	}
+	if err != nil {
+		var tooLarge *quic.DatagramTooLargeError
+		if errors.As(err, &tooLarge) {
+			return composeICMPTooLargePacket(p, minMTU)
+		}
+		return nil, c.mapPacketError(err)
+	}
+	return nil, nil
+}
+
 func (c *Conn) composeDatagram(b []byte) ([]byte, error) {
 	// TODO: implement src, dst and ipproto checks
 	if len(b) == 0 {
@@ -537,6 +705,44 @@ func (c *Conn) composeDatagram(b []byte) ([]byte, error) {
 	data = append(data, contextIDZero...)
 	data = append(data, b...)
 	return data, nil
+}
+
+func (c *Conn) composeDatagramInPlace(b []byte) error {
+	if len(b) == 0 {
+		return nil
+	}
+	switch v := ipVersion(b); v {
+	case 4:
+		if len(b) < ipv4.HeaderLen {
+			return fmt.Errorf("connect-ip: IPv4 packet too short")
+		}
+		ihlWords := b[0] & 0x0f
+		if ihlWords < 5 {
+			return fmt.Errorf("connect-ip: invalid IPv4 header length: %d", ihlWords)
+		}
+		ihl := int(ihlWords) * 4
+		if ihl > len(b) {
+			return fmt.Errorf("connect-ip: IPv4 header length %d exceeds packet length %d", ihl, len(b))
+		}
+		if b[8] <= 1 {
+			return fmt.Errorf("connect-ip: datagram TTL too small: %d", b[8])
+		}
+		b[8]--
+		var header [ipv4.HeaderLen]byte
+		copy(header[:], b[:ipv4.HeaderLen])
+		binary.BigEndian.PutUint16(b[10:12], calculateIPv4Checksum(header))
+	case 6:
+		if len(b) < ipv6.HeaderLen {
+			return fmt.Errorf("connect-ip: IPv6 packet too short")
+		}
+		if b[7] <= 1 {
+			return fmt.Errorf("connect-ip: datagram Hop Limit too small: %d", b[7])
+		}
+		b[7]--
+	default:
+		return fmt.Errorf("connect-ip: unknown IP versions: %d", v)
+	}
+	return nil
 }
 
 func (c *Conn) Close() error {

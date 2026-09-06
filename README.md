@@ -5,7 +5,7 @@
 
 connect-ip-go is an implementation of the CONNECT-IP protocol [RFC 9484](https://datatracker.ietf.org/doc/html/rfc9484), allowing the proxying of IP packets in HTTP/3.
 
-It is based on [quic-go](https://github.com/quic-go/quic-go), and provides both a client and a proxy implementation.
+It is based on [quic-go](https://github.com/metacubex/quic-go), and provides both a client and a proxy implementation.
 
 It also implements [draft-ietf-masque-connect-ip-dns-06](https://datatracker.ietf.org/doc/html/draft-ietf-masque-connect-ip-dns-06), which adds DNS and PREF64 configuration to CONNECT-IP.
 

@@ -9,7 +9,7 @@ import (
 	"reflect"
 
 	"github.com/dunglas/httpsfv"
-	"github.com/quic-go/quic-go/http3"
+	"github.com/metacubex/quic-go/http3"
 	"github.com/yosida95/uritemplate/v3"
 )
 

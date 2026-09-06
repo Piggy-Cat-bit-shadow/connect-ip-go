@@ -8,8 +8,8 @@ import (
 	"net"
 	"net/http"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
+	"github.com/metacubex/quic-go"
+	"github.com/metacubex/quic-go/http3"
 )
 
 // defaultInitialPacketSize allows tunneling QUIC connections, which require an MTU of at least 1200 bytes.

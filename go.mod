@@ -1,10 +1,10 @@
-module github.com/quic-go/connect-ip-go
+module github.com/Piggy-Cat-bit-shadow/connect-ip-go
 
 go 1.26.0
 
 require (
 	github.com/dunglas/httpsfv v1.1.1
-	github.com/quic-go/quic-go v0.62.0
+	github.com/metacubex/quic-go v0.0.0-20260906020448-5dd41cf92b47
 	github.com/stretchr/testify v1.12.1
 	github.com/yosida95/uritemplate/v3 v3.0.2
 	golang.org/x/net v0.56.0
@@ -17,3 +17,5 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 )
+
+replace github.com/metacubex/quic-go => /Users/jie/Desktop/其他文件/quic-go-task

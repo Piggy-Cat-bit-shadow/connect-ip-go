@@ -10,7 +10,7 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/quic-go/quic-go/http3"
+	"github.com/metacubex/quic-go/http3"
 )
 
 var (

@@ -7,8 +7,8 @@ import (
 	"net/netip"
 	"testing"
 
-	"github.com/quic-go/quic-go/http3"
-	"github.com/quic-go/quic-go/quicvarint"
+	"github.com/metacubex/quic-go/http3"
+	"github.com/metacubex/quic-go/quicvarint"
 	"golang.org/x/net/dns/dnsmessage"
 
 	"github.com/stretchr/testify/require"

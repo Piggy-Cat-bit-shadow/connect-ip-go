@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
+	"github.com/metacubex/quic-go"
+	"github.com/metacubex/quic-go/http3"
 )
 
 // A ClientConn represents a connection to a single proxy server.
