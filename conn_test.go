@@ -107,11 +107,12 @@ var ipv6Header = []byte{
 }
 
 type mockStream struct {
-	reading         []byte
-	toRead          <-chan []byte
-	sendDatagramErr error
-	writeStarted    chan struct{}
-	written         chan<- []byte
+	reading            []byte
+	toRead             <-chan []byte
+	sendDatagramErr    error
+	receiveDatagramErr error
+	writeStarted       chan struct{}
+	written            chan<- []byte
 }
 
 var _ http3Stream = &mockStream{}
@@ -144,8 +145,53 @@ func (m *mockStream) SetReadDeadline(time.Time) error  { return nil }
 func (m *mockStream) SetDeadline(time.Time) error      { return nil }
 func (m *mockStream) SendDatagram(data []byte) error   { return m.sendDatagramErr }
 func (m *mockStream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+	if m.receiveDatagramErr != nil {
+		return nil, m.receiveDatagramErr
+	}
 	<-ctx.Done()
 	return nil, ctx.Err()
+}
+
+func TestPlainPacketAPIsNormalizeTerminalErrors(t *testing.T) {
+	terminalErrors := []error{
+		&quic.ApplicationError{Remote: true},
+		&quic.TransportError{Remote: true},
+		&quic.StreamError{Remote: true},
+		&quic.StatelessResetError{},
+		&quic.IdleTimeoutError{},
+		&quic.HandshakeTimeoutError{},
+		&http3.Error{Remote: true},
+		net.ErrClosed,
+		io.EOF,
+	}
+	validPacket, err := (&ipv4.Header{
+		Version:  4,
+		Len:      20,
+		TTL:      64,
+		Src:      net.IPv4(1, 2, 3, 4),
+		Dst:      net.IPv4(5, 6, 7, 8),
+		Protocol: 17,
+	}).Marshal()
+	require.NoError(t, err)
+
+	for _, terminalErr := range terminalErrors {
+		t.Run(terminalErr.Error()+"/ReadPacket", func(t *testing.T) {
+			conn := newProxiedConn(&mockStream{receiveDatagramErr: terminalErr}, nil)
+			_, err := conn.ReadPacket(make([]byte, 1500))
+			var closeErr *CloseError
+			require.ErrorAs(t, err, &closeErr)
+			require.ErrorIs(t, err, net.ErrClosed)
+			require.Same(t, err, conn.closeErr)
+		})
+		t.Run(terminalErr.Error()+"/WritePacket", func(t *testing.T) {
+			conn := newProxiedConn(&mockStream{sendDatagramErr: terminalErr}, nil)
+			_, err := conn.WritePacket(validPacket)
+			var closeErr *CloseError
+			require.ErrorAs(t, err, &closeErr)
+			require.ErrorIs(t, err, net.ErrClosed)
+			require.Same(t, err, conn.closeErr)
+		})
+	}
 }
 
 func TestCapsuleQueueLimit(t *testing.T) {

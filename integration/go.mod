@@ -4,7 +4,7 @@ go 1.26.0
 
 replace github.com/quic-go/connect-ip-go => github.com/Piggy-Cat-bit-shadow/connect-ip-go v0.0.0-20260906032003-4b59e688175a
 
-replace github.com/metacubex/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260906031434-26f04c632d35
+replace github.com/metacubex/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260906040817-b6c72f4e72ef
 
 require (
 	github.com/metacubex/quic-go v0.62.0

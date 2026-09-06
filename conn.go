@@ -403,12 +403,7 @@ func (c *Conn) ReadPacket(b []byte) (n int, err error) {
 start:
 	data, err := c.str.ReceiveDatagram(context.Background())
 	if err != nil {
-		select {
-		case <-c.closeChan:
-			return 0, c.closeErr
-		default:
-			return 0, err
-		}
+		return 0, c.mapPacketError(err)
 	}
 	contextID, n, err := quicvarint.Parse(data)
 	if err != nil {
@@ -647,7 +642,7 @@ func (c *Conn) WritePacket(b []byte) (icmp []byte, err error) {
 		case <-c.closeChan:
 			return nil, c.closeErr
 		default:
-			return nil, err
+			return nil, c.mapPacketError(err)
 		}
 	}
 	return nil, nil
