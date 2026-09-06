@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -17,6 +19,14 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+func testDuration(d time.Duration) time.Duration {
+	factor, err := strconv.Atoi(os.Getenv("TIMESCALE_FACTOR"))
+	if err != nil || factor < 1 {
+		return d
+	}
+	return d * time.Duration(factor)
+}
 
 func setupConns(t *testing.T) (client, server *Conn) {
 	t.Helper()
@@ -47,7 +57,7 @@ func setupConns(t *testing.T) (client, server *Conn) {
 	go func() { s.Serve(conn) }()
 	t.Cleanup(func() { s.Close() })
 
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), testDuration(time.Second))
 	defer cancel()
 	req, err := NewRequest(ctx, template)
 	require.NoError(t, err)
@@ -60,7 +70,7 @@ func setupConns(t *testing.T) (client, server *Conn) {
 	require.Equal(t, rsp.StatusCode, http.StatusOK)
 
 	select {
-	case <-time.After(time.Second):
+	case <-time.After(testDuration(time.Second)):
 		t.Fatal("timed out")
 	case conn := <-connChan:
 		return client, conn
