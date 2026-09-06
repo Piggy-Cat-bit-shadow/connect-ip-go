@@ -2,12 +2,14 @@ module github.com/quic-go/connect-ip-go/integration
 
 go 1.26.0
 
-replace github.com/quic-go/connect-ip-go => ..
+replace github.com/quic-go/connect-ip-go => github.com/Piggy-Cat-bit-shadow/connect-ip-go v0.0.0-20260906031748-d4db624bc4a8
+
+replace github.com/metacubex/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260906031434-26f04c632d35
 
 require (
+	github.com/metacubex/quic-go v0.62.0
 	// This version is a placeholder; the replacement above always uses the current checkout.
 	github.com/quic-go/connect-ip-go v0.0.0
-	github.com/metacubex/quic-go v0.62.0
 	github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8
 	github.com/stretchr/testify v1.12.1
 	github.com/vishvananda/netlink v1.3.0

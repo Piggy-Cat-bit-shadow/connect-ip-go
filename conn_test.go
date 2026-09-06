@@ -84,12 +84,10 @@ func TestTerminalCloseFirstStateWins(t *testing.T) {
 
 	concurrent := &Conn{closeChan: make(chan struct{})}
 	var wg sync.WaitGroup
-	for i := 0; i < 32; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 32 {
+		wg.Go(func() {
 			concurrent.markClosedError(&quic.ApplicationError{Remote: true}, true)
-		}()
+		})
 	}
 	wg.Wait()
 	require.ErrorAs(t, concurrent.closeErr, &got)

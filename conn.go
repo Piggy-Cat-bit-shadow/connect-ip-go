@@ -674,8 +674,7 @@ func (c *Conn) WritePacketBuffer(buf []byte, offset, length int) ([]byte, error)
 		return nil, nil
 	}
 	if err := c.str.SendDatagram(buf[dataOffset : dataOffset+dataLength]); err != nil {
-		var tooLarge *quic.DatagramTooLargeError
-		if errors.As(err, &tooLarge) {
+		if _, ok := errors.AsType[*quic.DatagramTooLargeError](err); ok {
 			return composeICMPTooLargePacket(p, minMTU)
 		}
 		return nil, c.mapPacketError(err)
@@ -713,8 +712,7 @@ func (c *Conn) WritePacketBufferOwned(buf []byte, offset, length int, owner Pack
 		err = c.str.SendDatagram(buf[dataOffset : dataOffset+dataLength])
 	}
 	if err != nil {
-		var tooLarge *quic.DatagramTooLargeError
-		if errors.As(err, &tooLarge) {
+		if _, ok := errors.AsType[*quic.DatagramTooLargeError](err); ok {
 			return composeICMPTooLargePacket(p, minMTU)
 		}
 		return nil, c.mapPacketError(err)
