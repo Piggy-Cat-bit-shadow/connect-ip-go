@@ -42,7 +42,7 @@ func TestNewClientConnRequiresDatagrams(t *testing.T) {
 	require.NoError(t, err)
 	defer ln.Close()
 
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), testDuration(time.Second))
 	defer cancel()
 	cconn, err := quic.DialAddr(
 		ctx,
