@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
+	"time"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -38,6 +39,7 @@ type http3Stream interface {
 	SendDatagram([]byte) error
 	CancelRead(quic.StreamErrorCode)
 	CancelWrite(quic.StreamErrorCode)
+	SetWriteDeadline(time.Time) error
 }
 
 type http3BufferStream interface {
@@ -82,21 +84,25 @@ const minMTU = 1280
 // immediately. The queue only grows if the peer falls behind processing the stream.
 const maxQueuedCapsules = 128
 
+type streamWrite struct {
+	Data []byte
+	Fin  bool
+}
+
 // Conn is a connection that proxies IP packets over HTTP/3.
 type Conn struct {
 	str         http3Stream
 	closeConn   func() error
 	writeNotify chan struct{}
+	writeDone   chan error
 
 	assignedAddressUpdates  chan []netip.Prefix
 	availableRouteUpdates   chan []IPRoute
 	dnsConfigurationUpdates chan []DNSConfiguration
 	pref64Updates           chan []netip.Prefix
 
-	mu sync.Mutex
-	// queuedCapsules contains the capsules serialized by the send methods. This
-	// allows callers to modify the values passed to a send method after it returns.
-	queuedCapsules    [][]byte
+	mu                sync.Mutex
+	queuedWrites      []streamWrite
 	peerAddresses     []netip.Prefix // IP prefixes that we assigned to the peer
 	localRoutes       []IPRoute      // IP routes that we advertised to the peer
 	assignedAddresses []netip.Prefix
@@ -110,6 +116,7 @@ func newProxiedConn(str http3Stream, closeConn func() error) *Conn {
 		str:                     str,
 		closeConn:               closeConn,
 		writeNotify:             make(chan struct{}, 1),
+		writeDone:               make(chan error, 1),
 		assignedAddressUpdates:  make(chan []netip.Prefix, 1),
 		availableRouteUpdates:   make(chan []IPRoute, 1),
 		dnsConfigurationUpdates: make(chan []DNSConfiguration, 1),
@@ -126,14 +133,27 @@ func newProxiedConn(str http3Stream, closeConn func() error) *Conn {
 			c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeExcessiveLoad))
 		} else {
 			c.markClosedError(nil, true)
-			c.str.Close()
+			_ = c.queueWrite(streamWrite{Fin: true})
 		}
 	}()
 	go func() {
-		if err := c.writeToStream(); err != nil {
+		err := c.writeToStream()
+		if err != nil {
 			log.Printf("writing to stream failed: %v", err)
-			c.markClosedError(err, true)
+			c.mu.Lock()
+			closed := c.closeErr != nil
+			c.mu.Unlock()
+			if !closed {
+				c.markClosedError(err, true)
+				c.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeExcessiveLoad))
+				c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeExcessiveLoad))
+			} else {
+				// A write can time out while graceful shutdown is pending.
+				c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeNoError))
+			}
 		}
+		c.writeDone <- err
+		close(c.writeDone)
 	}()
 	return c
 }
@@ -154,7 +174,7 @@ func (c *Conn) AdvertiseRoute(routes []IPRoute) error {
 		return err
 	}
 	routes = slices.Clone(routes)
-	err := c.queueCapsule((&routeAdvertisementCapsule{IPAddressRanges: routes}).append(nil))
+	err := c.queueWrite(streamWrite{Data: (&routeAdvertisementCapsule{IPAddressRanges: routes}).append(nil)})
 	if err == nil {
 		c.localRoutes = routes
 	}
@@ -180,7 +200,7 @@ func (c *Conn) AssignAddresses(prefixes []netip.Prefix) error {
 		c.mu.Unlock()
 		return err
 	}
-	err := c.queueCapsule(capsule.append(nil))
+	err := c.queueWrite(streamWrite{Data: capsule.append(nil)})
 	if err == nil {
 		c.peerAddresses = slices.Clone(prefixes)
 	}
@@ -260,7 +280,7 @@ func (c *Conn) sendCapsule(capsuleData []byte) error {
 		c.mu.Unlock()
 		return err
 	}
-	err := c.queueCapsule(capsuleData)
+	err := c.queueWrite(streamWrite{Data: capsuleData})
 	c.mu.Unlock()
 	if err != nil {
 		_ = c.Close()
@@ -269,13 +289,20 @@ func (c *Conn) sendCapsule(capsuleData []byte) error {
 	return nil
 }
 
-func (c *Conn) queueCapsule(capsuleData []byte) error {
-	if len(c.queuedCapsules) >= maxQueuedCapsules {
+func (c *Conn) queueWrite(w streamWrite) error {
+	if w.Fin {
+		// Interrupt pending capsule writes so shutdown cannot stall.
+		_ = c.str.SetWriteDeadline(time.Now())
+	} else if len(c.queuedWrites) >= maxQueuedCapsules {
+		c.closeErr = &CloseError{Remote: false}
+		close(c.closeChan)
+		c.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeExcessiveLoad))
+		c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeExcessiveLoad))
+		close(c.writeNotify)
 		return errors.New("connect-ip: capsule queue full")
 	}
-	// Consecutive capsules of the same type could be coalesced here, but that
-	// micro-optimization is not worth the added complexity without evidence.
-	c.queuedCapsules = append(c.queuedCapsules, capsuleData)
+
+	c.queuedWrites = append(c.queuedWrites, w)
 
 	select {
 	case c.writeNotify <- struct{}{}:
@@ -380,33 +407,27 @@ func (c *Conn) readFromStream() error {
 }
 
 func (c *Conn) writeToStream() error {
-	for {
-		select {
-		case <-c.closeChan:
-			return c.closeErr
-		case <-c.writeNotify:
-			for {
-				c.mu.Lock()
-				if c.closeErr != nil {
-					err := c.closeErr
-					c.mu.Unlock()
-					return err
-				}
-				if len(c.queuedCapsules) == 0 {
-					c.mu.Unlock()
-					break
-				}
-				capsuleData := c.queuedCapsules[0]
-				c.queuedCapsules[0] = nil
-				c.queuedCapsules = c.queuedCapsules[1:]
+	for range c.writeNotify {
+		for {
+			c.mu.Lock()
+			if len(c.queuedWrites) == 0 {
 				c.mu.Unlock()
+				break
+			}
+			w := c.queuedWrites[0]
+			c.queuedWrites[0] = streamWrite{}
+			c.queuedWrites = c.queuedWrites[1:]
+			c.mu.Unlock()
 
-				if _, err := c.str.Write(capsuleData); err != nil {
-					return err
-				}
+			if w.Fin {
+				return c.str.Close()
+			}
+			if _, err := c.str.Write(w.Data); err != nil {
+				return err
 			}
 		}
 	}
+	return c.closeErr
 }
 
 func (c *Conn) ReadPacket(b []byte) (n int, err error) {
@@ -772,13 +793,17 @@ func (c *Conn) composeDatagramInPlace(b []byte) error {
 }
 
 func (c *Conn) Close() error {
-	c.markClosedError(&CloseError{Remote: false}, false)
 	c.mu.Lock()
+	if c.closeErr == nil {
+		c.closeErr = &CloseError{Remote: false}
+		close(c.closeChan)
+		_ = c.queueWrite(streamWrite{Fin: true})
+	}
 	closeConn := c.closeConn
 	c.closeConn = nil
 	c.mu.Unlock()
+	err := <-c.writeDone
 	c.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
-	err := c.str.Close()
 	if closeConn != nil {
 		return errors.Join(err, closeConn())
 	}
