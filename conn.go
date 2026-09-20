@@ -134,6 +134,10 @@ type Conn struct {
 	closeErr  error
 }
 
+// maxOwnedPacketBatch bounds per-call temporary slices in the owned batch
+// path. Keep aligned with quic-go's MaxDatagramBatchSize.
+const maxOwnedPacketBatch = 32
+
 func newProxiedConn(str http3Stream, closeConn func() error) *Conn {
 	c := &Conn{
 		str:                     str,
@@ -877,6 +881,7 @@ func (c *Conn) TryWritePacketBuffersOwnedBatch(packets []OwnedPacketBuffer) (int
 	if len(packets) == 0 {
 		return 0, nil, nil
 	}
+	packets = packets[:min(len(packets), maxOwnedPacketBatch)]
 	for _, packet := range packets {
 		if packet.Offset < len(contextIDZero) || packet.Offset > len(packet.Buffer) || packet.Length < 0 || packet.Length > len(packet.Buffer)-packet.Offset {
 			return 0, nil, fmt.Errorf("connect-ip: invalid packet buffer range: offset=%d length=%d buffer=%d", packet.Offset, packet.Length, len(packet.Buffer))
@@ -901,17 +906,18 @@ func (c *Conn) TryWritePacketBuffersOwnedBatch(packets []OwnedPacketBuffer) (int
 			}
 		}
 		accepted, err := sender.TrySendDatagramBuffersOwnedBatch(wireBuffers)
-		if err == nil {
-			for i := accepted; i < len(packets); i++ {
+		if accepted < 0 || accepted > len(packets) {
+			for i := range packets {
 				p := packets[i].Buffer[packets[i].Offset : packets[i].Offset+packets[i].Length]
 				restoreMutableIPHeader(p, heads[i])
 			}
-			return accepted, nil, nil
+			return 0, nil, fmt.Errorf("invalid accepted DATAGRAM batch count %d/%d", accepted, len(packets))
 		}
-		for i := range packets {
+		for i := accepted; i < len(packets); i++ {
 			p := packets[i].Buffer[packets[i].Offset : packets[i].Offset+packets[i].Length]
 			restoreMutableIPHeader(p, heads[i])
 		}
+		return accepted, nil, err
 	}
 
 	// Preserve compatibility with HTTP/3 stream implementations without batch

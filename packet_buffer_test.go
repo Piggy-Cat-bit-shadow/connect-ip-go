@@ -26,15 +26,18 @@ type packetBufferTestStream struct {
 
 type packetBufferBatchTestStream struct {
 	packetBufferTestStream
-	accepted int
-	batches  [][]byte
+	accepted  int
+	batchErr  error
+	batchSize int
+	batches   [][]byte
 }
 
 func (s *packetBufferBatchTestStream) TrySendDatagramBuffersOwnedBatch(buffers []http3.OwnedDatagramBuffer) (int, error) {
+	s.batchSize = len(buffers)
 	for _, buffer := range buffers[:s.accepted] {
 		s.batches = append(s.batches, append([]byte(nil), buffer.Buffer[buffer.Offset:buffer.Offset+buffer.Length]...))
 	}
-	return s.accepted, nil
+	return s.accepted, s.batchErr
 }
 
 func (s *packetBufferTestStream) Read([]byte) (int, error)         { return 0, nil }
@@ -198,6 +201,57 @@ func TestTryWritePacketBuffersOwnedBatchRestoresUnacceptedSuffix(t *testing.T) {
 
 	owners[0].Release()
 	owners[1].Release()
+}
+
+func TestTryWritePacketBuffersOwnedBatchBoundsOversizedInput(t *testing.T) {
+	s := &packetBufferBatchTestStream{accepted: 1}
+	c := packetBufferTestConn(s)
+	packets := make([]OwnedPacketBuffer, maxOwnedPacketBatch+8)
+	owners := make([]*packetBufferTestOwner, len(packets))
+	for i := range packets {
+		buf := make([]byte, 8+20)
+		copy(buf[8:], packetBufferTestIP())
+		owners[i] = new(packetBufferTestOwner)
+		packets[i] = OwnedPacketBuffer{Buffer: buf, Offset: 8, Length: 20, Owner: owners[i]}
+	}
+	accepted, _, err := c.TryWritePacketBuffersOwnedBatch(packets)
+	require.NoError(t, err)
+	require.Equal(t, 1, accepted)
+	require.Equal(t, maxOwnedPacketBatch, s.batchSize, "temporary work must be capped")
+	require.Len(t, s.batches, 1)
+	require.Zero(t, owners[0].releases.Load(), "accepted ownership transfers")
+	require.Equal(t, packetBufferTestIP(), packets[1].Buffer[8:], "partial suffix is restored for retry")
+	require.Equal(t, packetBufferTestIP(), packets[maxOwnedPacketBatch].Buffer[8:], "unsubmitted suffix is untouched")
+	for _, owner := range owners {
+		owner.Release()
+	}
+	for _, owner := range owners {
+		require.Equal(t, int32(1), owner.releases.Load())
+	}
+}
+
+func TestTryWritePacketBuffersOwnedBatchPreservesAcceptedPrefixOnError(t *testing.T) {
+	batchErr := errors.New("fault after accepting prefix")
+	s := &packetBufferBatchTestStream{accepted: 1, batchErr: batchErr}
+	c := packetBufferTestConn(s)
+	original := [][]byte{packetBufferTestIP(), packetBufferTestIP()}
+	packets := make([]OwnedPacketBuffer, len(original))
+	owners := []*packetBufferTestOwner{new(packetBufferTestOwner), new(packetBufferTestOwner)}
+	for i := range packets {
+		buf := make([]byte, 8+len(original[i]))
+		copy(buf[8:], original[i])
+		packets[i] = OwnedPacketBuffer{Buffer: buf, Offset: 8, Length: len(original[i]), Owner: owners[i]}
+	}
+	accepted, _, err := c.TryWritePacketBuffersOwnedBatch(packets)
+	require.ErrorIs(t, err, batchErr)
+	require.Equal(t, 1, accepted)
+	require.Equal(t, byte(63), packets[0].Buffer[16], "accepted packet remains transport-owned")
+	require.Equal(t, original[1], packets[1].Buffer[8:], "unaccepted packet is restored")
+	for _, owner := range owners {
+		owner.Release()
+	}
+	require.Equal(t, int32(1), owners[0].releases.Load())
+	require.Equal(t, int32(1), owners[1].releases.Load())
 }
 
 func TestWritePacketBufferRejectsInsufficientHeadroom(t *testing.T) {
