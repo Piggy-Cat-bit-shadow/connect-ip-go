@@ -62,6 +62,10 @@ type http3TryOwnedBufferSender interface {
 	TrySendDatagramBufferOwned([]byte, int, int, quic.DatagramPayloadOwner) (bool, error)
 }
 
+type http3TryOwnedBufferBatchSender interface {
+	TrySendDatagramBuffersOwnedBatch([]http3.OwnedDatagramBuffer) (int, error)
+}
+
 type http3DatagramWritable interface {
 	DatagramWritable() <-chan struct{}
 }
@@ -72,6 +76,13 @@ type http3RuntimeStats interface {
 
 // PacketPayloadOwner owns the backing storage passed to WritePacketBufferOwned.
 type PacketPayloadOwner interface{ Release() }
+
+// OwnedPacketBuffer is one CONNECT-IP payload for a nonblocking batch send.
+type OwnedPacketBuffer struct {
+	Buffer         []byte
+	Offset, Length int
+	Owner          PacketPayloadOwner
+}
 
 // PacketBuffer is a zero-copy view over a QUIC datagram buffer.
 type PacketBuffer quic.DatagramBuffer
@@ -824,6 +835,99 @@ func (c *Conn) TryWritePacketBufferOwned(buf []byte, offset, length int, owner P
 		}
 	}
 	return icmp, accepted, err
+}
+
+type mutableIPHeader struct {
+	version byte
+	fields  [3]byte
+}
+
+func saveMutableIPHeader(p []byte) mutableIPHeader {
+	saved := mutableIPHeader{version: ipVersion(p)}
+	switch saved.version {
+	case 4:
+		if len(p) >= 12 {
+			saved.fields = [3]byte{p[8], p[10], p[11]}
+		}
+	case 6:
+		if len(p) >= 8 {
+			saved.fields[0] = p[7]
+		}
+	}
+	return saved
+}
+
+func restoreMutableIPHeader(p []byte, saved mutableIPHeader) {
+	switch saved.version {
+	case 4:
+		if len(p) >= 12 {
+			p[8], p[10], p[11] = saved.fields[0], saved.fields[1], saved.fields[2]
+		}
+	case 6:
+		if len(p) >= 8 {
+			p[7] = saved.fields[0]
+		}
+	}
+}
+
+// TryWritePacketBuffersOwnedBatch consumes the largest prefix accepted by the
+// QUIC queue. Accepted owners transfer; all suffix owners remain caller-owned.
+// ICMP responses are indexed by accepted entry and may be nil.
+func (c *Conn) TryWritePacketBuffersOwnedBatch(packets []OwnedPacketBuffer) (int, [][]byte, error) {
+	if len(packets) == 0 {
+		return 0, nil, nil
+	}
+	for _, packet := range packets {
+		if packet.Offset < len(contextIDZero) || packet.Offset > len(packet.Buffer) || packet.Length < 0 || packet.Length > len(packet.Buffer)-packet.Offset {
+			return 0, nil, fmt.Errorf("connect-ip: invalid packet buffer range: offset=%d length=%d buffer=%d", packet.Offset, packet.Length, len(packet.Buffer))
+		}
+	}
+	if sender, ok := c.str.(http3TryOwnedBufferBatchSender); ok {
+		wireBuffers := make([]http3.OwnedDatagramBuffer, len(packets))
+		heads := make([]mutableIPHeader, len(packets))
+		for i, packet := range packets {
+			p := packet.Buffer[packet.Offset : packet.Offset+packet.Length]
+			heads[i] = saveMutableIPHeader(p)
+			if err := c.composeDatagramInPlace(p); err != nil {
+				for j := 0; j < i; j++ {
+					restoreMutableIPHeader(packets[j].Buffer[packets[j].Offset:packets[j].Offset+packets[j].Length], heads[j])
+				}
+				return 0, nil, err
+			}
+			copy(packet.Buffer[packet.Offset-len(contextIDZero):packet.Offset], contextIDZero)
+			wireBuffers[i] = http3.OwnedDatagramBuffer{
+				Buffer: packet.Buffer, Offset: packet.Offset - len(contextIDZero),
+				Length: packet.Length + len(contextIDZero), Owner: packet.Owner,
+			}
+		}
+		accepted, err := sender.TrySendDatagramBuffersOwnedBatch(wireBuffers)
+		if err == nil {
+			for i := accepted; i < len(packets); i++ {
+				p := packets[i].Buffer[packets[i].Offset : packets[i].Offset+packets[i].Length]
+				restoreMutableIPHeader(p, heads[i])
+			}
+			return accepted, nil, nil
+		}
+		for i := range packets {
+			p := packets[i].Buffer[packets[i].Offset : packets[i].Offset+packets[i].Length]
+			restoreMutableIPHeader(p, heads[i])
+		}
+	}
+
+	// Preserve compatibility with HTTP/3 stream implementations without batch
+	// support. Each item still uses explicit Try/Writable semantics.
+	responses := make([][]byte, 0, len(packets))
+	for i, packet := range packets {
+		icmp, accepted, err := c.TryWritePacketBufferOwned(packet.Buffer, packet.Offset, packet.Length, packet.Owner)
+		if err != nil {
+			return i, responses, err
+		}
+		if !accepted {
+			return i, responses, nil
+		}
+		responses = append(responses, icmp)
+	}
+	return len(packets), responses, nil
 }
 
 // DatagramWritable reports when a previously-full QUIC DATAGRAM queue can

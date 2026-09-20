@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/metacubex/quic-go"
+	"github.com/metacubex/quic-go/http3"
 	"github.com/metacubex/quic-go/quicvarint"
 	"github.com/stretchr/testify/require"
 )
@@ -21,6 +22,19 @@ type packetBufferTestStream struct {
 	ownedCalls  int
 	tryAccepted bool
 	sent        [][]byte
+}
+
+type packetBufferBatchTestStream struct {
+	packetBufferTestStream
+	accepted int
+	batches  [][]byte
+}
+
+func (s *packetBufferBatchTestStream) TrySendDatagramBuffersOwnedBatch(buffers []http3.OwnedDatagramBuffer) (int, error) {
+	for _, buffer := range buffers[:s.accepted] {
+		s.batches = append(s.batches, append([]byte(nil), buffer.Buffer[buffer.Offset:buffer.Offset+buffer.Length]...))
+	}
+	return s.accepted, nil
 }
 
 func (s *packetBufferTestStream) Read([]byte) (int, error)         { return 0, nil }
@@ -156,6 +170,34 @@ func TestTryWritePacketBufferOwnedRestoresPacketOnBackpressure(t *testing.T) {
 	require.True(t, accepted)
 	require.Equal(t, byte(63), buf[16], "accepted IPv4 packet has its TTL decremented exactly once")
 	require.Zero(t, owner.releases.Load(), "ownership transfers to the transport")
+}
+
+func TestTryWritePacketBuffersOwnedBatchRestoresUnacceptedSuffix(t *testing.T) {
+	s := &packetBufferBatchTestStream{accepted: 1}
+	c := packetBufferTestConn(s)
+	original := [][]byte{packetBufferTestIP(), packetBufferTestIP()}
+	buffers := make([][]byte, len(original))
+	owners := []*packetBufferTestOwner{new(packetBufferTestOwner), new(packetBufferTestOwner)}
+	packets := make([]OwnedPacketBuffer, len(original))
+	for i := range original {
+		buffers[i] = make([]byte, 8+len(original[i]))
+		copy(buffers[i][8:], original[i])
+		packets[i] = OwnedPacketBuffer{Buffer: buffers[i], Offset: 8, Length: len(original[i]), Owner: owners[i]}
+	}
+
+	accepted, responses, err := c.TryWritePacketBuffersOwnedBatch(packets)
+	require.NoError(t, err)
+	require.Equal(t, 1, accepted)
+	require.Empty(t, responses)
+	require.Equal(t, byte(63), buffers[0][16], "accepted IPv4 packet is prepared exactly once")
+	require.Equal(t, original[1], buffers[1][8:], "unaccepted suffix remains retryable")
+	require.Zero(t, owners[0].releases.Load(), "accepted owner transferred to transport")
+	require.Zero(t, owners[1].releases.Load(), "suffix ownership remains with caller")
+	require.Len(t, s.batches, 1)
+	require.Equal(t, byte(0), s.batches[0][0], "CONNECT-IP context ID is prefixed")
+
+	owners[0].Release()
+	owners[1].Release()
 }
 
 func TestWritePacketBufferRejectsInsufficientHeadroom(t *testing.T) {
