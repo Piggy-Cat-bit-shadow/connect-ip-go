@@ -919,13 +919,17 @@ func (c *Conn) TryWritePacketBuffersOwnedBatch(packets []OwnedPacketBuffer) (int
 	responses := make([][]byte, 0, len(packets))
 	for i, packet := range packets {
 		icmp, accepted, err := c.TryWritePacketBufferOwned(packet.Buffer, packet.Offset, packet.Length, packet.Owner)
+		if accepted {
+			responses = append(responses, icmp)
+			if err != nil {
+				return i + 1, responses, err
+			}
+			continue
+		}
 		if err != nil {
 			return i, responses, err
 		}
-		if !accepted {
-			return i, responses, nil
-		}
-		responses = append(responses, icmp)
+		return i, responses, nil
 	}
 	return len(packets), responses, nil
 }
