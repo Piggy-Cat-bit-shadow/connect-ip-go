@@ -22,10 +22,11 @@ type packetBufferTestStream struct {
 	sent        [][]byte
 }
 
-func (s *packetBufferTestStream) Read([]byte) (int, error)        { return 0, nil }
-func (s *packetBufferTestStream) Write(p []byte) (int, error)     { return len(p), nil }
-func (s *packetBufferTestStream) Close() error                    { return nil }
-func (s *packetBufferTestStream) CancelRead(quic.StreamErrorCode) {}
+func (s *packetBufferTestStream) Read([]byte) (int, error)         { return 0, nil }
+func (s *packetBufferTestStream) Write(p []byte) (int, error)      { return len(p), nil }
+func (s *packetBufferTestStream) Close() error                     { return nil }
+func (s *packetBufferTestStream) CancelRead(quic.StreamErrorCode)  {}
+func (s *packetBufferTestStream) CancelWrite(quic.StreamErrorCode) {}
 func (s *packetBufferTestStream) SendDatagram(p []byte) error {
 	s.sent = append(s.sent, append([]byte(nil), p...))
 	return s.sendErr
@@ -135,10 +136,11 @@ type legacyPacketStream struct {
 	sendErr error
 }
 
-func (s *legacyPacketStream) Read([]byte) (int, error)        { return 0, context.Canceled }
-func (s *legacyPacketStream) Write(p []byte) (int, error)     { return len(p), nil }
-func (s *legacyPacketStream) Close() error                    { return nil }
-func (s *legacyPacketStream) CancelRead(quic.StreamErrorCode) {}
+func (s *legacyPacketStream) Read([]byte) (int, error)         { return 0, context.Canceled }
+func (s *legacyPacketStream) Write(p []byte) (int, error)      { return len(p), nil }
+func (s *legacyPacketStream) Close() error                     { return nil }
+func (s *legacyPacketStream) CancelRead(quic.StreamErrorCode)  {}
+func (s *legacyPacketStream) CancelWrite(quic.StreamErrorCode) {}
 func (s *legacyPacketStream) ReceiveDatagram(context.Context) ([]byte, error) {
 	return nil, context.Canceled
 }
