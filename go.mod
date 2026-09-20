@@ -18,4 +18,4 @@ require (
 	golang.org/x/text v0.40.0 // indirect
 )
 
-replace github.com/metacubex/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260920162804-3df05b7289e7
+replace github.com/metacubex/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260920163345-6c7a489285b3
