@@ -299,14 +299,14 @@ func TestClosing(t *testing.T) {
 	select {
 	case err := <-routeErrChan:
 		require.ErrorIs(t, err, net.ErrClosed)
-	case <-time.After(time.Second):
+	case <-time.After(testDuration(time.Second)):
 		t.Fatal("timeout")
 	}
 
 	select {
 	case err := <-prefixErrChan:
 		require.ErrorIs(t, err, net.ErrClosed)
-	case <-time.After(time.Second):
+	case <-time.After(testDuration(time.Second)):
 		t.Fatal("timeout")
 	}
 

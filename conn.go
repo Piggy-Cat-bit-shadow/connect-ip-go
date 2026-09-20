@@ -894,7 +894,7 @@ func (c *Conn) TryWritePacketBuffersOwnedBatch(packets []OwnedPacketBuffer) (int
 			p := packet.Buffer[packet.Offset : packet.Offset+packet.Length]
 			heads[i] = saveMutableIPHeader(p)
 			if err := c.composeDatagramInPlace(p); err != nil {
-				for j := 0; j < i; j++ {
+				for j := range i {
 					restoreMutableIPHeader(packets[j].Buffer[packets[j].Offset:packets[j].Offset+packets[j].Length], heads[j])
 				}
 				return 0, nil, err
