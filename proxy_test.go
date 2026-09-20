@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/metacubex/quic-go"
 	"github.com/metacubex/quic-go/http3"
 	"github.com/yosida95/uritemplate/v3"
 	"golang.org/x/net/ipv4"
@@ -100,6 +101,25 @@ func TestAddressAssignment(t *testing.T) {
 	routes, err = server.LocalPrefixes(ctx)
 	require.NoError(t, err)
 	require.Empty(t, routes)
+}
+
+func TestProxyRuntimeStatsUsesServerQUICStream(t *testing.T) {
+	client, server := setupConns(t)
+	require.NoError(t, server.AssignAddresses([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}))
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	_, err := client.LocalPrefixes(ctx)
+	require.NoError(t, err)
+	var stats quic.RuntimeStats
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+		stats = server.RuntimeStats()
+		if stats.CongestionWindow != 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	require.NotZero(t, stats.CongestionWindow, "%+v", stats)
+	require.NotZero(t, stats.CurrentPMTU, "%+v", stats)
 }
 
 func TestRouteAdvertisement(t *testing.T) {

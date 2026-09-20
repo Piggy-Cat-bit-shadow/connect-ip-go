@@ -117,6 +117,13 @@ type mockStream struct {
 
 var _ http3Stream = &mockStream{}
 
+func TestRuntimeStatsFallbackForCustomStream(t *testing.T) {
+	c := &Conn{str: &mockStream{}}
+	if got := c.RuntimeStats(); got != (quic.RuntimeStats{}) {
+		t.Fatalf("custom stream runtime stats = %#v, want zero value", got)
+	}
+}
+
 func (m *mockStream) StreamID() quic.StreamID { panic("implement me") }
 func (m *mockStream) Read(p []byte) (int, error) {
 	if len(m.reading) == 0 {
