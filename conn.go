@@ -58,6 +58,10 @@ type http3OwnedBufferSender interface {
 	SendDatagramBufferOwned([]byte, int, int, quic.DatagramPayloadOwner) error
 }
 
+type http3RuntimeStats interface {
+	RuntimeStats() quic.RuntimeStats
+}
+
 // PacketPayloadOwner owns the backing storage passed to WritePacketBufferOwned.
 type PacketPayloadOwner interface{ Release() }
 
@@ -156,6 +160,16 @@ func newProxiedConn(str http3Stream, closeConn func() error) *Conn {
 		close(c.writeDone)
 	}()
 	return c
+}
+
+// RuntimeStats returns the identity-free diagnostics of the QUIC connection
+// carrying this CONNECT-IP stream. If a custom stream implementation doesn't
+// expose runtime statistics, the zero value is returned.
+func (c *Conn) RuntimeStats() quic.RuntimeStats {
+	if s, ok := c.str.(http3RuntimeStats); ok {
+		return s.RuntimeStats()
+	}
+	return quic.RuntimeStats{}
 }
 
 // AdvertiseRoute schedules an advertisement of the available routes to the peer.
