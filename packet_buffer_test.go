@@ -19,6 +19,7 @@ type packetBufferTestStream struct {
 	tryQueue    []*quic.DatagramBuffer
 	sendErr     error
 	ownedCalls  int
+	tryAccepted bool
 	sent        [][]byte
 }
 
@@ -59,6 +60,15 @@ func (s *packetBufferTestStream) SendDatagramBuffer([]byte, int, int) error { re
 func (s *packetBufferTestStream) SendDatagramBufferOwned([]byte, int, int, quic.DatagramPayloadOwner) error {
 	s.ownedCalls++
 	return s.sendErr
+}
+func (s *packetBufferTestStream) TrySendDatagramBufferOwned([]byte, int, int, quic.DatagramPayloadOwner) (bool, error) {
+	s.ownedCalls++
+	return s.tryAccepted, s.sendErr
+}
+func (s *packetBufferTestStream) DatagramWritable() <-chan struct{} {
+	c := make(chan struct{})
+	close(c)
+	return c
 }
 
 type packetBufferTestOwner struct{ releases atomic.Int32 }
@@ -123,6 +133,29 @@ func TestWritePacketBufferOwnedReleasesOnError(t *testing.T) {
 	_, err := c.WritePacketBufferOwned(buf, 1, len(ip), o)
 	require.Error(t, err)
 	require.EqualValues(t, 1, o.releases.Load())
+}
+
+func TestTryWritePacketBufferOwnedRestoresPacketOnBackpressure(t *testing.T) {
+	s := &packetBufferTestStream{}
+	c := packetBufferTestConn(s)
+	ip := packetBufferTestIP()
+	original := append([]byte(nil), ip...)
+	buf := make([]byte, 8+len(ip))
+	copy(buf[8:], ip)
+	owner := new(packetBufferTestOwner)
+
+	_, accepted, err := c.TryWritePacketBufferOwned(buf, 8, len(ip), owner)
+	require.NoError(t, err)
+	require.False(t, accepted)
+	require.Equal(t, original, buf[8:], "backpressure must leave packet bytes retryable")
+	require.Zero(t, owner.releases.Load(), "unaccepted packet remains caller-owned")
+
+	s.tryAccepted = true
+	_, accepted, err = c.TryWritePacketBufferOwned(buf, 8, len(ip), owner)
+	require.NoError(t, err)
+	require.True(t, accepted)
+	require.Equal(t, byte(63), buf[16], "accepted IPv4 packet has its TTL decremented exactly once")
+	require.Zero(t, owner.releases.Load(), "ownership transfers to the transport")
 }
 
 func TestWritePacketBufferRejectsInsufficientHeadroom(t *testing.T) {

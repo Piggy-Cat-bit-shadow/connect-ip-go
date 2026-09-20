@@ -58,6 +58,14 @@ type http3OwnedBufferSender interface {
 	SendDatagramBufferOwned([]byte, int, int, quic.DatagramPayloadOwner) error
 }
 
+type http3TryOwnedBufferSender interface {
+	TrySendDatagramBufferOwned([]byte, int, int, quic.DatagramPayloadOwner) (bool, error)
+}
+
+type http3DatagramWritable interface {
+	DatagramWritable() <-chan struct{}
+}
+
 type http3RuntimeStats interface {
 	RuntimeStats() quic.RuntimeStats
 }
@@ -758,6 +766,73 @@ func (c *Conn) WritePacketBufferOwned(buf []byte, offset, length int, owner Pack
 		return nil, c.mapPacketError(err)
 	}
 	return nil, nil
+}
+
+// TryWritePacketBufferOwned submits without blocking on QUIC DATAGRAM
+// capacity. accepted=false means the packet and owner remain with the caller.
+// accepted=true includes packets consumed as an ICMP Packet Too Big response.
+func (c *Conn) TryWritePacketBufferOwned(buf []byte, offset, length int, owner PacketPayloadOwner) (icmp []byte, accepted bool, err error) {
+	if offset < len(contextIDZero) || offset > len(buf) || length < 0 || length > len(buf)-offset {
+		return nil, false, fmt.Errorf("connect-ip: invalid packet buffer range: offset=%d length=%d buffer=%d", offset, length, len(buf))
+	}
+	p := buf[offset : offset+length]
+	var saved [3]byte
+	version := ipVersion(p)
+	switch version {
+	case 4:
+		if len(p) >= 12 {
+			saved = [3]byte{p[8], p[10], p[11]}
+		}
+	case 6:
+		if len(p) >= 8 {
+			saved[0] = p[7]
+		}
+	}
+	if err := c.composeDatagramInPlace(p); err != nil {
+		return nil, false, err
+	}
+	copy(buf[offset-len(contextIDZero):offset], contextIDZero)
+	dataOffset, dataLength := offset-len(contextIDZero), length+len(contextIDZero)
+	if sender, ok := c.str.(http3TryOwnedBufferSender); ok {
+		accepted, err = sender.TrySendDatagramBufferOwned(buf, dataOffset, dataLength, owner)
+	} else {
+		err = c.str.SendDatagram(buf[dataOffset : dataOffset+dataLength])
+		accepted = err == nil
+		if accepted && owner != nil {
+			owner.Release()
+		}
+	}
+	if err != nil {
+		if _, ok := errors.AsType[*quic.DatagramTooLargeError](err); ok {
+			if owner != nil {
+				owner.Release()
+			}
+			icmp, err = composeICMPTooLargePacket(p, minMTU)
+			return icmp, true, err
+		}
+	}
+	if !accepted || err != nil {
+		switch version {
+		case 4:
+			if len(p) >= 12 {
+				p[8], p[10], p[11] = saved[0], saved[1], saved[2]
+			}
+		case 6:
+			if len(p) >= 8 {
+				p[7] = saved[0]
+			}
+		}
+	}
+	return icmp, accepted, err
+}
+
+// DatagramWritable reports when a previously-full QUIC DATAGRAM queue can
+// accept work. It is intended to be selected alongside the session context.
+func (c *Conn) DatagramWritable() <-chan struct{} {
+	if sender, ok := c.str.(http3DatagramWritable); ok {
+		return sender.DatagramWritable()
+	}
+	return nil
 }
 
 func (c *Conn) composeDatagram(b []byte) ([]byte, error) {

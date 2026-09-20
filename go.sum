@@ -1,5 +1,5 @@
-github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260920121748-02ac8e5cb125 h1:RY9E2CvfFNviK5Saef2cgaJIpkW9WFsI+oHc1uBby1c=
-github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260920121748-02ac8e5cb125/go.mod h1:wSLVa9CU2j2Go9SRmgcjRIwsd2sIEpRyKophg3YLLYQ=
+github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260920133120-8b824e7a7b70 h1:hjBd7KnJmeNTT6n0CKHNzg1nfanasiPrrT+W5jpD258=
+github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260920133120-8b824e7a7b70/go.mod h1:wSLVa9CU2j2Go9SRmgcjRIwsd2sIEpRyKophg3YLLYQ=
 github.com/dunglas/httpsfv v1.1.1 h1:HoSs101zIE9I23DlqlmljJ/OIi7ILwrH347pXhRZdxI=
 github.com/dunglas/httpsfv v1.1.1/go.mod h1:zID2mqw9mFsnt7YC3vYQ9/cjq30q41W+1AnDwH8TiMg=
 github.com/quic-go/go-ossfuzz-seeds v0.1.0 h1:APacT+iIaNF6fd8AGEiN3bT/Jtkd2jz4v4TzM7MFjy0=
