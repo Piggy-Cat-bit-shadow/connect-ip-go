@@ -34,6 +34,9 @@ func composeICMPTooLargePacket(b []byte, mtu int) ([]byte, error) {
 		if len(b) < ipv6.HeaderLen {
 			return nil, errors.New("connect-ip: IPv6 packet too short")
 		}
+		if mtu < 1280 {
+			mtu = 1280
+		}
 		icmpMessage = &icmp.Message{
 			Type: ipv6.ICMPTypePacketTooBig,
 			Body: &icmp.PacketTooBig{

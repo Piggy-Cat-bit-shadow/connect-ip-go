@@ -532,6 +532,27 @@ func TestIncomingDatagrams(t *testing.T) {
 	})
 }
 
+func TestIncomingIPv6ExtensionProtocolFiltering(t *testing.T) {
+	conn := newProxiedConn(&mockStream{}, nil)
+	src := netip.MustParseAddr("::1")
+	dst := netip.MustParseAddr("::2")
+	require.NoError(t, conn.AssignAddresses([]netip.Prefix{netip.PrefixFrom(src, 128)}))
+	require.NoError(t, conn.AdvertiseRoute([]IPRoute{{StartIP: dst, EndIP: dst, IPProtocol: 6}}))
+
+	options := []byte{6, 0, 0, 0, 0, 0, 0, 0}
+	packet := makeIPv6TestPacket(ipProtoDestination, append(options, make([]byte, 20)...))
+	require.NoError(t, conn.handleIncomingProxiedPacket(packet))
+
+	packet = makeIPv6TestPacket(ipProtoDestination, append([]byte{17, 0, 0, 0, 0, 0, 0, 0}, make([]byte, 8)...))
+	require.ErrorContains(t, conn.handleIncomingProxiedPacket(packet), "protocol: 17")
+
+	// A non-first fragment has no transport header to inspect. The protocol
+	// filter uses the Fragment header's Next Header field and never reads past it.
+	fragment := []byte{6, 0, 0, 8, 0, 0, 0, 1}
+	packet = makeIPv6TestPacket(ipProtoFragment, fragment)
+	require.NoError(t, conn.handleIncomingProxiedPacket(packet))
+}
+
 func TestSkipUnknownCapsule(t *testing.T) {
 	readChan := make(chan []byte, 1)
 	conn := newProxiedConn(&mockStream{toRead: readChan}, nil)

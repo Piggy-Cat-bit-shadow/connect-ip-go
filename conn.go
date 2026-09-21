@@ -637,12 +637,13 @@ func (c *Conn) handleIncomingProxiedPacket(data []byte) error {
 		dst = netip.AddrFrom4([4]byte(data[16:20]))
 		ipProto = data[9]
 	case 6:
-		if len(data) < ipv6.HeaderLen {
+		info, ok := parseIPv6ProxiedPacket(data)
+		if !ok {
 			return fmt.Errorf("connect-ip: malformed datagram: too short")
 		}
 		src = netip.AddrFrom16([16]byte(data[8:24]))
 		dst = netip.AddrFrom16([16]byte(data[24:40]))
-		ipProto = data[6]
+		ipProto = info.protocol
 	}
 
 	c.mu.Lock()

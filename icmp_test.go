@@ -1,6 +1,8 @@
 package connectip
 
 import (
+	"bytes"
+	"encoding/binary"
 	"net"
 	"net/netip"
 	"testing"
@@ -51,12 +53,12 @@ func TestICMPTooLargeIPv6(t *testing.T) {
 	dst := netip.MustParseAddr("1:2:3:4::5")
 	orig := []byte{
 		0x60, 0x00, 0x00, 0x00, // Version, Traffic Class, Flow Label
-		0x00, 0x00, // Payload Length
-		0x00, 0x2a, // Next Header, Hop Limit (42)
+		0x00, 0x08, // Payload Length
+		0x00, 0x2a, // Hop-by-Hop Options, Hop Limit (42)
 	}
 	orig = append(orig, src.AsSlice()...)
 	orig = append(orig, dst.AsSlice()...)
-	orig = append(orig, []byte("foobar")...)
+	orig = append(orig, []byte{59, 0, 1, 4, 0, 0, 0, 0}...) // extension header followed by no-next-header
 	data, err := composeICMPTooLargePacket(orig, mtu)
 	require.NoError(t, err)
 
@@ -75,6 +77,18 @@ func TestICMPTooLargeIPv6(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, mtu, icmpBody.MTU)
 	require.Equal(t, orig, icmpBody.Data)
+	require.Equal(t, len(data)-ipv6.HeaderLen, int(binary.BigEndian.Uint16(data[4:6])))
+	// Parsing then remarshal with the IPv6 pseudo-header must reproduce the
+	// checksum-bearing ICMPv6 message exactly.
+	serialized, err := icmpMsg.Marshal(icmp.IPv6PseudoHeader(data[8:24], data[24:40]))
+	require.NoError(t, err)
+	require.True(t, bytes.Equal(serialized, data[ipv6.HeaderLen:]), "ICMPv6 pseudo-header checksum mismatch")
+
+	clamped, err := composeICMPTooLargePacket(orig, 1000)
+	require.NoError(t, err)
+	clampedMessage, err := icmp.ParseMessage(ipProtoICMPv6, clamped[ipv6.HeaderLen:])
+	require.NoError(t, err)
+	require.Equal(t, 1280, clampedMessage.Body.(*icmp.PacketTooBig).MTU)
 }
 
 func TestICMPFailures(t *testing.T) {
