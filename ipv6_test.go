@@ -60,7 +60,7 @@ func TestParseIPv6ProxiedPacketRejectsMalformedLengthsAndChains(t *testing.T) {
 		{"invalid AH length", func() []byte { return makeIPv6TestPacket(ipProtoAH, []byte{17, 0, 0, 0, 0, 0, 0, 0}) }},
 		{"too many extensions", func() []byte {
 			payload := make([]byte, 9*8)
-			for i := 0; i < 9; i++ {
+			for i := range 9 {
 				payload[i*8] = ipProtoDestination
 			}
 			payload[8*8] = 17

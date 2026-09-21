@@ -38,7 +38,7 @@ func parseIPv6ProxiedPacket(packet []byte) (ipv6ProxiedInfo, bool) {
 	next := packet[6]
 	offset := ipv6FixedHeaderLen
 	extBytes := 0
-	for count := 0; count < maxIPv6ExtensionHeaders; count++ {
+	for range maxIPv6ExtensionHeaders {
 		var length int
 		switch next {
 		case ipProtoHopByHop, ipProtoRouting, ipProtoDestination:
